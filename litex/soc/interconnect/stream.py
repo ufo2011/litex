@@ -293,6 +293,25 @@ class Demultiplexer(Module):
             cases[i] = self.sink.connect(source)
         self.comb += Case(self.sel, cases)
 
+
+# Gate ---------------------------------------------------------------------------------------------
+
+class Gate(Module):
+    def __init__(self, layout, sink_ready_when_disabled=False):
+        self.sink   = Endpoint(layout)
+        self.source = Endpoint(layout)
+        self.enable = Signal()
+
+        # # #
+
+        self.comb += [
+            If(self.enable,
+                self.sink.connect(self.source)
+            ).Else(
+                self.sink.ready.eq(int(sink_ready_when_disabled))
+            )
+        ]
+
 # Converter ----------------------------------------------------------------------------------------
 
 class _UpConverter(Module):
@@ -844,25 +863,22 @@ class Pipeline(Module):
     def __init__(self, *modules):
         n = len(modules)
         m = modules[0]
-        # expose sink of first module
-        # if available
+        # Expose sink of first module if available.
         if hasattr(m, "sink"):
             self.sink = m.sink
+        # Iterate on Modules/Endpoints.
         for i in range(1, n):
             m_n = modules[i]
-            if isinstance(m, Endpoint):
-                source = m
-            else:
-                source = m.source
-            if isinstance(m_n, Endpoint):
-                sink = m_n
-            else:
-                sink = m_n.sink
+            # If m is an Endpoint, use it as Source, else use Module.source.
+            source = m if isinstance(m, Endpoint) else m.source
+            # If m_n is an Endpoint, use it as Sink, else use Module.sink.
+            sink = m_n if isinstance(m_n, Endpoint) else m_n.sink
+            # Connect Source to Sink (when m is not m_n).
             if m is not m_n:
                 self.comb += source.connect(sink)
+            # Update m.
             m = m_n
-        # expose source of last module
-        # if available
+        # Expose source of last module if available.
         if hasattr(m, "source"):
             self.source = m.source
 

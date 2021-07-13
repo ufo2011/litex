@@ -233,7 +233,7 @@ class SoCBusHandler(Module):
         for _, search_region in search_regions.items():
             origin = search_region.origin
             while (origin + size) < (search_region.origin + search_region.size_pow2):
-                # Create a Candicate.
+                # Create a Candidate.
                 candidate = SoCRegion(origin=origin, size=size, cached=cached)
                 overlap   = False
                 # Check Candidate does not overlap with allocated existing regions.
@@ -658,7 +658,10 @@ class SoCIRQHandler(SoCLocHandler):
 class SoCController(Module, AutoCSR):
     def __init__(self, with_reset=True, with_scratch=True, with_errors=True):
         if with_reset:
-            self._reset = CSRStorage(1, description="""Any write to this register will reset the SoC.""")
+            self._reset = CSRStorage(fields=[
+                CSRField("soc_rst", size=1, offset=0, pulse=True, description="""Write `1` to this register to reset the full SoC (Pulse Reset)"""),
+                CSRField("cpu_rst", size=1, offset=1,             description="""Write `1` to this register to reset the CPU(s) of the SoC (Hold Reset)"""),
+            ])
         if with_scratch:
             self._scratch = CSRStorage(32, reset=0x12345678, description="""
                 Use this register as a scratch space to verify that software read/write accesses
@@ -671,8 +674,8 @@ class SoCController(Module, AutoCSR):
 
         # Reset
         if with_reset:
-            self.reset = Signal()
-            self.comb += self.reset.eq(self._reset.re)
+            self.soc_rst = self._reset.fields.soc_rst
+            self.cpu_rst = self._reset.fields.cpu_rst
 
         # Errors
         if with_errors:
@@ -861,7 +864,7 @@ class SoC(Module):
         self.add_config("CSR_DATA_WIDTH", self.csr.data_width)
         self.add_config("CSR_ALIGNMENT",  self.csr.alignment)
 
-    def add_cpu(self, name="vexriscv", variant="standard", cls=None, reset_address=None):
+    def add_cpu(self, name="vexriscv", variant="standard", cls=None, reset_address=None, cfu=None):
         # Check that CPU is supported.
         if name not in cpu.CPUS.keys():
             self.logger.error("{} CPU {}, supporteds: {}.".format(
@@ -885,6 +888,10 @@ class SoC(Module):
             raise
         self.check_if_exists("cpu")
         self.submodules.cpu = cpu_cls(self.platform, variant)
+
+        # Add optional CFU plugin.
+        if "cfu" in variant and hasattr(self.cpu, "add_cfu"):
+            self.cpu.add_cfu(cfu_filename=cfu)
 
         # Update SoC with CPU constraints.
         for n, (origin, size) in enumerate(self.cpu.io_regions.items()):
@@ -918,8 +925,11 @@ class SoC(Module):
 
             # Connect SoCController's reset to CPU reset.
             if hasattr(self, "ctrl"):
-                if hasattr(self.ctrl, "reset"):
-                    self.comb += self.cpu.reset.eq(self.ctrl.reset)
+                self.comb += self.cpu.reset.eq(
+                    # Reset the CPU on...
+                    getattr(self.ctrl, "soc_rst", 0) | # Full SoC Reset command...
+                    getattr(self.ctrl, "cpu_rst", 0)   # or on CPU Reset command.
+                )
             self.add_config("CPU_RESET_ADDR", reset_address)
 
         # Add CPU's SoC components (if any).
@@ -952,11 +962,11 @@ class SoC(Module):
         }[self.bus.standard]
 
         # SoC Reset --------------------------------------------------------------------------------
-        # Connect SoCController's reset to CRG's reset if presents.
+        # Connect soc_rst to CRG's rst if presents.
         if hasattr(self, "ctrl") and hasattr(self, "crg"):
-            if hasattr(self.ctrl, "_reset") and hasattr(self.crg, "rst"):
-                if isinstance(self.crg.rst, Signal):
-                    self.comb += self.crg.rst.eq(self.ctrl._reset.re)
+            crg_rst = getattr(self.crg, "rst", None)
+            if isinstance(crg_rst, Signal):
+                self.comb += crg_rst.eq(getattr(self.ctrl, "soc_rst", 0))
 
         # SoC CSR bridge ---------------------------------------------------------------------------
         # FIXME: for now, use registered CSR bridge when SDRAM is present; find the best compromise.
@@ -1070,12 +1080,17 @@ class SoC(Module):
                     continue
                 if hasattr(self, name):
                     module = getattr(self, name)
-                    if not hasattr(module, "ev"):
+                    ev = None
+                    if hasattr(module, "ev"):
+                        ev = module.ev
+                    elif isinstance(module, EventManager):
+                        ev = module
+                    else:
                         self.logger.error("EventManager {} in {} SubModule.".format(
                             colorer("not found", color="red"),
                             colorer(name)))
                         raise
-                    self.comb += self.cpu.interrupt[loc].eq(module.ev.irq)
+                    self.comb += self.cpu.interrupt[loc].eq(ev.irq)
                 self.add_constant(name + "_INTERRUPT", loc)
 
         # SoC Infos --------------------------------------------------------------------------------
@@ -1198,11 +1213,11 @@ class LiteXSoC(SoC):
         self.bus.add_master(name="uartbone", master=self.uartbone.wishbone)
 
     # Add JTAGbone ---------------------------------------------------------------------------------
-    def add_jtagbone(self):
+    def add_jtagbone(self, chain=1):
         from litex.soc.cores import uart
         from litex.soc.cores.jtag import JTAGPHY
         self.check_if_exists("jtabone")
-        self.submodules.jtagbone_phy = JTAGPHY(device=self.platform.device)
+        self.submodules.jtagbone_phy = JTAGPHY(device=self.platform.device, chain=chain)
         self.submodules.jtagbone = uart.UARTBone(phy=self.jtagbone_phy, clk_freq=self.sys_clk_freq)
         self.bus.add_master(name="jtagbone", master=self.jtagbone.wishbone)
 
@@ -1311,7 +1326,7 @@ class LiteXSoC(SoC):
                         self.submodules += LiteDRAMWishbone2Native(
                             wishbone     = litedram_wb,
                             port         = port,
-                            base_address = origin)
+                            base_address = self.bus.regions["main_ram"].origin)
                         self.submodules += wishbone.Converter(mem_wb, litedram_wb)
                 # Check if bus is a Native bus and connect it.
                 if isinstance(mem_bus, LiteDRAMNativePort):
@@ -1558,6 +1573,8 @@ class LiteXSoC(SoC):
             self.sdirq.mem2block_dma.trigger.eq(self.sdmem2block.irq),
             self.sdirq.cmd_done.trigger.eq(self.sdcore.cmd_event.fields.done)
         ]
+        if self.irq.enabled:
+            self.irq.add("sdirq", use_loc_if_exists=True)
 
         # Debug.
         if software_debug:
@@ -1673,7 +1690,7 @@ class LiteXSoC(SoC):
 
         # Video Timing Generator.
         self.check_if_exists(f"{name}_vtg")
-        vtg = VideoTimingGenerator(default_video_timings=timings)
+        vtg = VideoTimingGenerator(default_video_timings=timings if isinstance(timings, str) else timings[1])
         vtg = ClockDomainsRenamer(clock_domain)(vtg)
         setattr(self.submodules, f"{name}_vtg", vtg)
 
@@ -1685,7 +1702,7 @@ class LiteXSoC(SoC):
         # Connect Video Timing Generator to ColorsBars Pattern.
         self.comb += [
             vtg.source.connect(colorbars.vtg_sink),
-            colorbars.source.connect(phy.sink)
+            colorbars.source.connect(phy if isinstance(phy, stream.Endpoint) else phy.sink)
         ]
 
     # Add Video Terminal ---------------------------------------------------------------------------
@@ -1695,11 +1712,12 @@ class LiteXSoC(SoC):
 
         # Video Timing Generator.
         self.check_if_exists(f"{name}_vtg")
-        vtg = VideoTimingGenerator(default_video_timings=timings)
+        vtg = VideoTimingGenerator(default_video_timings=timings if isinstance(timings, str) else timings[1])
         vtg = ClockDomainsRenamer(clock_domain)(vtg)
         setattr(self.submodules, f"{name}_vtg", vtg)
 
         # Video Terminal.
+        timings = timings if isinstance(timings, str) else timings[0]
         vt = VideoTerminal(
             hres = int(timings.split("@")[0].split("x")[0]),
             vres = int(timings.split("@")[0].split("x")[1]),
@@ -1714,13 +1732,13 @@ class LiteXSoC(SoC):
         uart_cdc = stream.ClockDomainCrossing([("data", 8)], cd_from="sys", cd_to=clock_domain)
         setattr(self.submodules, f"{name}_uart_cdc", uart_cdc)
         self.comb += [
-            uart_cdc.sink.valid.eq(self.uart.source.valid & self.uart.source.ready),
-            uart_cdc.sink.data.eq(self.uart.source.data),
+            uart_cdc.sink.valid.eq(self.uart.tx_fifo.source.valid & self.uart.tx_fifo.source.ready),
+            uart_cdc.sink.data.eq(self.uart.tx_fifo.source.data),
             uart_cdc.source.connect(vt.uart_sink),
         ]
 
         # Connect Video Terminal to Video PHY.
-        self.comb += vt.source.connect(phy.sink)
+        self.comb += vt.source.connect(phy if isinstance(phy, stream.Endpoint) else phy.sink)
 
     # Add Video Framebuffer ------------------------------------------------------------------------
     def add_video_framebuffer(self, name="video_framebuffer", phy=None, timings="800x600@60Hz", clock_domain="sys"):
@@ -1728,11 +1746,12 @@ class LiteXSoC(SoC):
         from litex.soc.cores.video import VideoTimingGenerator, VideoFrameBuffer
 
         # Video Timing Generator.
-        vtg = VideoTimingGenerator(default_video_timings=timings)
+        vtg = VideoTimingGenerator(default_video_timings=timings if isinstance(timings, str) else timings[1])
         vtg = ClockDomainsRenamer(clock_domain)(vtg)
         setattr(self.submodules, f"{name}_vtg", vtg)
 
         # Video FrameBuffer.
+        timings = timings if isinstance(timings, str) else timings[0]
         base = self.mem_map.get(name, 0x40c00000)
         hres = int(timings.split("@")[0].split("x")[0])
         vres = int(timings.split("@")[0].split("x")[1])
@@ -1749,7 +1768,7 @@ class LiteXSoC(SoC):
         self.comb += vtg.source.connect(vfb.vtg_sink)
 
         # Connect Video FrameBuffer to Video PHY.
-        self.comb += vfb.source.connect(phy.sink)
+        self.comb += vfb.source.connect(phy if isinstance(phy, stream.Endpoint) else phy.sink)
 
         # Constants.
         self.add_constant("VIDEO_FRAMEBUFFER_BASE", base)
