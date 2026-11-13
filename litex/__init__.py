@@ -1,6 +1,22 @@
 import sys
 
+# Migen/Python 3.14+ Compatibility -----------------------------------------------------------------
+
+def _migen_python_compat():
+    try:
+        from migen.fhdl import tracer
+    except ImportError:
+        return
+
+    for opcode in ["LOAD_FAST_BORROW", "LOAD_FAST_CHECK"]:
+        tracer._load_build_opcodes.setdefault(opcode, tracer._bytecode_length_version_guard(3))
+
+
+_migen_python_compat()
+
 from litex.tools.litex_client import RemoteClient
+
+# Python-Data Import Helper ------------------------------------------------------------------------
 
 def get_data_mod(data_type, data_name):
     """Get the pythondata-{}-{} module or raise a useful error message."""
@@ -16,5 +32,5 @@ pythondata-{dt}-{dn} module not installed! Unable to use {dn} {dt}.
 {e}
 
 You can install this by running;
- pip install git+https://github.com/litex-hub/pythondata-{dt}-{dn}.git
-""".format(dt=data_type, dn=data_name, e=e))
+ pip3 install git+https://github.com/litex-hub/pythondata-{dt}-{dn}.git
+""".format(dt=data_type, dn=data_name, e=e)) from None

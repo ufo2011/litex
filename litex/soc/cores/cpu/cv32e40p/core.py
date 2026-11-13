@@ -10,25 +10,32 @@ import re
 from migen import *
 from migen.fhdl.specials import Tristate
 
+from litex.gen import *
+
 from litex import get_data_mod
 from litex.soc.interconnect import wishbone, stream
 from litex.soc.interconnect.csr import *
 from litex.soc.cores.cpu import CPU, CPU_GCC_TRIPLE_RISCV32
 
+# Variants -----------------------------------------------------------------------------------------
 
-CPU_VARIANTS = ["standard", "full"]
+CPU_VARIANTS = ["standard", "standard+fpu"]
+
+# GCC Flags ----------------------------------------------------------------------------------------
 
 GCC_FLAGS = {
-    #                       /-------- Base ISA
-    #                       |/------- Hardware Multiply + Divide
-    #                       ||/----- Atomics
-    #                       |||/---- Compressed ISA
-    #                       ||||/--- Single-Precision Floating-Point
-    #                       |||||/-- Double-Precision Floating-Point
-    #                       imacfd
-    "standard": "-march=rv32imc    -mabi=ilp32 ",
-    "full":     "-march=rv32imfc   -mabi=ilp32 ",
+    #                       /------------ Base ISA
+    #                       |    /------- Hardware Multiply + Divide
+    #                       |    |/----- Atomics
+    #                       |    ||/---- Compressed ISA
+    #                       |    |||/--- Single-Precision Floating-Point
+    #                       |    ||||/-- Double-Precision Floating-Point
+    #                       i    macfd
+    "standard": "-march=rv32i2p0_mc    -mabi=ilp32 ",
+    "standard+fpu": "-march=rv32i2p0_mfc   -mabi=ilp32 ",
 }
+
+# OBI / APB / Trace Layouts ------------------------------------------------------------------------
 
 obi_layout = [
     ("req",    1),
@@ -52,38 +59,29 @@ apb_layout = [
     ("pslverr", 1),
 ]
 
-trace_layout = [
-    ("ivalid",     1),
-    ("iexception", 1),
-    ("interrupt",  1),
-    ("cause",      5),
-    ("tval",      32),
-    ("priv",       3),
-    ("iaddr",     32),
-    ("instr",     32),
-    ("compressed", 1),
-]
+# Helpers ------------------------------------------------------------------------------------------
 
 def add_manifest_sources(platform, manifest):
     basedir = get_data_mod("cpu", "cv32e40p").data_location
     with open(os.path.join(basedir, manifest), 'r') as f:
         for l in f:
-            res = re.search('\$\{DESIGN_RTL_DIR\}/(.+)', l)
+            res = re.search(r'\$\{DESIGN_RTL_DIR\}/(.+)', l)
             if res and not re.match('//', l):
-                if re.match('\+incdir\+', l):
+                if re.match(r'\+incdir\+', l):
                     platform.add_verilog_include_path(os.path.join(basedir, 'rtl', res.group(1)))
                 else:
                     platform.add_source(os.path.join(basedir, 'rtl', res.group(1)))
 
+# OBI <> Wishbone ----------------------------------------------------------------------------------
 
-class OBI2Wishbone(Module):
+class OBI2Wishbone(LiteXModule):
     def __init__(self, obi, wb):
         addr  = Signal.like(obi.addr)
         be    = Signal.like(obi.be)
         we    = Signal.like(obi.we)
         wdata = Signal.like(obi.wdata)
 
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+        self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             # On OBI request:
             If(obi.req,
@@ -126,9 +124,9 @@ class OBI2Wishbone(Module):
             )
         )
 
-class Wishbone2OBI(Module):
+class Wishbone2OBI(LiteXModule):
     def __init__(self, wb, obi):
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+        self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(wb.cyc & wb.stb,
                 obi.req.eq(1),
@@ -148,9 +146,11 @@ class Wishbone2OBI(Module):
             wb.dat_r.eq(obi.rdata),
         ]
 
-class Wishbone2APB(Module):
+# Wishbone <> APB ----------------------------------------------------------------------------------
+
+class Wishbone2APB(LiteXModule):
     def __init__(self, wb, apb):
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+        self.fsm = fsm = FSM(reset_state="IDLE")
         fsm.act("IDLE",
             If(wb.cyc & wb.stb,
                 NextState("ACK"),
@@ -170,96 +170,9 @@ class Wishbone2APB(Module):
             wb.dat_r.eq(apb.prdata),
         ]
 
-class TraceCollector(Module, AutoCSR):
-    def __init__(self, trace_depth=16384):
-        self.bus  = bus  = wishbone.Interface()
-        self.sink = sink = stream.Endpoint([("data", 32)])
+# Debug Module -------------------------------------------------------------------------------------
 
-        clear   = Signal()
-        enable  = Signal()
-        pointer = Signal(32)
-
-        self._enable  = CSRStorage()
-        self._clear   = CSRStorage()
-        self._pointer = CSRStatus(32)
-
-        mem = Memory(32, trace_depth)
-        rd_port = mem.get_port()
-        wr_port = mem.get_port(write_capable=True)
-
-        self.specials += rd_port, wr_port, mem
-
-        self.sync += [
-            # wishbone
-            bus.ack.eq(0),
-            If(bus.cyc & bus.stb & ~bus.ack, bus.ack.eq(1)),
-            # trace core
-            If(clear, pointer.eq(0)).Else(
-                If(sink.ready & sink.valid, pointer.eq(pointer+1)),
-            ),
-        ]
-
-        self.comb += [
-            # wishbone
-            rd_port.adr.eq(bus.adr),
-            bus.dat_r.eq(rd_port.dat_r),
-            # trace core
-            wr_port.adr.eq(pointer),
-            wr_port.dat_w.eq(sink.data),
-            wr_port.we.eq(sink.ready & sink.valid),
-            sink.ready.eq(enable & (pointer < trace_depth)),
-            # csrs
-            enable.eq(self._enable.storage),
-            clear.eq(self._clear.storage),
-            self._pointer.status.eq(pointer),
-        ]
-
-class TraceDebugger(Module):
-    def __init__(self):
-        self.bus      = wishbone.Interface()
-        self.source   = source   = stream.Endpoint([("data", 32)])
-        self.trace_if = trace_if = Record(trace_layout)
-
-        apb = Record(apb_layout)
-
-        self.submodules.bus_conv = Wishbone2APB(self.bus, apb)
-
-        self.trace_params = dict(
-            # clk / rst
-            i_clk_i               = ClockSignal(),
-            i_rst_ni              = ~ResetSignal(),
-            i_test_mode_i         = 0,
-            # cpu interface
-            i_ivalid_i            = trace_if.ivalid,
-            i_iexception_i        = trace_if.iexception,
-            i_interrupt_i         = trace_if.interrupt,
-            i_cause_i             = trace_if.cause,
-            i_tval_i              = trace_if.tval,
-            i_priv_i              = trace_if.priv,
-            i_iaddr_i             = trace_if.iaddr,
-            i_instr_i             = trace_if.instr,
-            i_compressed_i        = trace_if.compressed,
-            # apb interface
-            i_paddr_i             = apb.paddr,
-            i_pwdata_i            = apb.pwdata,
-            i_pwrite_i            = apb.pwrite,
-            i_psel_i              = apb.psel,
-            i_penable_i           = apb.penable,
-            o_prdata_o            = apb.prdata,
-            o_pready_o            = apb.pready,
-            o_pslverr_o           = apb.pslverr,
-            # data output
-            o_packet_word_o       = source.data,
-            o_packet_word_valid_o = source.valid,
-            i_grant_i             = source.ready,
-        )
-        self.specials += Instance("trace_debugger", **self.trace_params)
-
-    @staticmethod
-    def add_sources(platform):
-        add_manifest_sources(platform, "cv32e40p_trace_manifest.flist")
-
-class DebugModule(Module):
+class DebugModule(LiteXModule):
     jtag_layout = [
         ("tck",  1),
         ("tms",  1),
@@ -271,13 +184,13 @@ class DebugModule(Module):
         if pads is None:
             pads = Record(self.jtag_layout)
         self.pads = pads
-        self.dmbus = wishbone.Interface()
-        self.sbbus = wishbone.Interface()
+        self.dmbus = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+        self.sbbus = wishbone.Interface(data_width=32, address_width=32, addressing="word")
         dmbus = Record(obi_layout)
         sbbus = Record(obi_layout)
 
-        self.submodules.sbbus_conv = OBI2Wishbone(sbbus, self.sbbus)
-        self.submodules.dmbus_conv = Wishbone2OBI(self.dmbus, dmbus)
+        self.sbbus_conv = OBI2Wishbone(sbbus, self.sbbus)
+        self.dmbus_conv = Wishbone2OBI(self.dmbus, dmbus)
 
         self.debug_req = Signal()
         self.ndmreset  = Signal()
@@ -289,18 +202,21 @@ class DebugModule(Module):
         self.specials += Tristate(pads.tdo, tdo_o, tdo_oe, tdo_i)
 
         self.dm_params = dict(
-            i_clk       = ClockSignal(),
-            i_rst_n     = ~ResetSignal(),
+            # Clk / Rst.
+            i_clk       = ClockSignal("sys"),
+            i_rst_n     = ~ResetSignal("sys"),
             o_ndmreset  = self.ndmreset,
             o_debug_req = self.debug_req,
-            # slave bus
+
+            # Slave Bus.
             i_dm_req    = dmbus.req,
             i_dm_we     = dmbus.we,
             i_dm_addr   = dmbus.addr,
             i_dm_be     = dmbus.be,
             i_dm_wdata  = dmbus.wdata,
             o_dm_rdata  = dmbus.rdata,
-            # master bus
+
+            # Master Bus.
             o_sb_req    = sbbus.req,
             o_sb_addr   = sbbus.addr,
             o_sb_we     = sbbus.we,
@@ -309,7 +225,8 @@ class DebugModule(Module):
             i_sb_gnt    = sbbus.gnt,
             i_sb_rvalid = sbbus.rvalid,
             i_sb_rdata  = sbbus.rdata,
-            # jtag
+
+            # JTAG.
             i_tck       = pads.tck,
             i_tms       = pads.tms,
             i_trst_n    = pads.trst,
@@ -325,12 +242,11 @@ class DebugModule(Module):
 
         self.specials += Instance("dm_wrap", **self.dm_params)
 
-    @staticmethod
-    def add_sources(platform):
-        add_manifest_sources(platform, "cv32e40p_dm_manifest.flist")
-
+# CV32E40P -----------------------------------------------------------------------------------------
 
 class CV32E40P(CPU):
+    family               = "riscv"
+    category             = "softcore"
     name                 = "cv32e40p"
     human_name           = "CV32E40P"
     variants             = CPU_VARIANTS
@@ -339,32 +255,33 @@ class CV32E40P(CPU):
     gcc_triple           = CPU_GCC_TRIPLE_RISCV32
     linker_output_format = "elf32-littleriscv"
     nop                  = "nop"
-    io_regions           = {0x80000000: 0x80000000} # origin, length
+    io_regions           = {0x80000000: 0x80000000} # Origin, Length.
+    has_fpu              = ["standard+fpu"]
 
-    has_fpu              = ["full"]
-
+    # GCC Flags.
     @property
     def gcc_flags(self):
         flags = GCC_FLAGS[self.variant]
         flags += "-D__cv32e40p__ "
-
         return flags
 
     def __init__(self, platform, variant="standard"):
-        self.platform     = platform
-        self.variant      = variant
-        self.reset        = Signal()
-        self.ibus         = wishbone.Interface()
-        self.dbus         = wishbone.Interface()
-        self.periph_buses = [self.ibus, self.dbus]
-        self.memory_buses = []
-        self.interrupt    = Signal(15)
+        self.platform          = platform
+        self.variant           = variant
+        self.reset             = Signal()
+        self.ibus              = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+        self.dbus              = wishbone.Interface(data_width=32, address_width=32, addressing="word")
+        self.periph_buses      = [self.ibus, self.dbus]
+        self.memory_buses      = []
+        self.interrupt         = Signal(16)
+        self.interrupt_padding = Signal(16)
 
         ibus = Record(obi_layout)
         dbus = Record(obi_layout)
 
-        self.submodules.ibus_conv = OBI2Wishbone(ibus, self.ibus)
-        self.submodules.dbus_conv = OBI2Wishbone(dbus, self.dbus)
+        # OBI <> Wishbone.
+        self.ibus_conv = OBI2Wishbone(ibus, self.ibus)
+        self.dbus_conv = OBI2Wishbone(dbus, self.dbus)
 
         self.comb += [
             ibus.we.eq(0),
@@ -372,20 +289,26 @@ class CV32E40P(CPU):
         ]
 
         self.cpu_params = dict(
-            i_clk_i              = ClockSignal(),
-            i_rst_ni             = ~ResetSignal(),
-            i_clock_en_i         = 1,
-            i_test_en_i          = 0,
-            i_fregfile_disable_i = 0,
-            i_core_id_i          = 0,
-            i_cluster_id_i       = 0,
-            # ibus
+            # Clk / Rst.
+            i_clk_i              = ClockSignal("sys"),
+            i_rst_ni             = ~ResetSignal("sys"),
+
+            # Controls.
+            i_pulp_clock_en_i     = 1,
+            i_scan_cg_en_i        = 0,
+            i_mtvec_addr_i        = 0,
+            i_dm_halt_addr_i      = 0,
+            i_hart_id_i           = 0,
+            i_dm_exception_addr_i = 0,
+
+            # IBus.
             o_instr_req_o        = ibus.req,
             i_instr_gnt_i        = ibus.gnt,
             i_instr_rvalid_i     = ibus.rvalid,
             o_instr_addr_o       = ibus.addr,
             i_instr_rdata_i      = ibus.rdata,
-            # dbus
+
+            # DBus.
             o_data_req_o         = dbus.req,
             i_data_gnt_i         = dbus.gnt,
             i_data_rvalid_i      = dbus.rvalid,
@@ -394,53 +317,33 @@ class CV32E40P(CPU):
             o_data_addr_o        = dbus.addr,
             o_data_wdata_o       = dbus.wdata,
             i_data_rdata_i       = dbus.rdata,
-            # apu
-            i_apu_master_gnt_i   = 0,
-            i_apu_master_valid_i = 0,
-            # ir q
-            i_irq_sec_i          = 0,
-            i_irq_software_i     = 0,
-            i_irq_external_i     = 0,
-            i_irq_fast_i         = self.interrupt,
-            i_irq_nmi_i          = 0,
-            i_irq_fastx_i        = 0,
-            # debug
-            i_debug_req_i        = 0,
-            # cpu control
-            i_fetch_enable_i     = 1,
+
+            # IRQ.
+            i_irq_i          = Cat(self.interrupt_padding, self.interrupt),
+
+            # Debug.
+            i_debug_req_i    = 0,
+
+            # CPU Control.
+            i_fetch_enable_i = 1,
         )
 
-        # add verilog sources
-        add_manifest_sources(platform, 'cv32e40p_manifest.flist')
-
+        # Add Verilog sources.
         if variant in self.has_fpu:
+            # Specific FPU variant parameters/files.
             self.cpu_params.update(p_FPU=1)
             add_manifest_sources(platform, 'cv32e40p_fpu_manifest.flist')
+        else:
+            add_manifest_sources(platform, 'cv32e40p_manifest.flist')
 
     def add_debug_module(self, dm):
         self.cpu_params.update(i_debug_req_i=dm.debug_req)
-        self.cpu_params.update(i_rst_ni=~(ResetSignal() | dm.ndmreset))
-
-    def add_trace_core(self, trace):
-        trace_if = trace.trace_if
-
-        self.cpu_params.update(
-            o_ivalid_o     = trace_if.ivalid,
-            o_iexception_o = trace_if.iexception,
-            o_interrupt_o  = trace_if.interrupt,
-            o_cause_o      = trace_if.cause,
-            o_tval_o       = trace_if.tval,
-            o_priv_o       = trace_if.priv,
-            o_iaddr_o      = trace_if.iaddr,
-            o_instr_o      = trace_if.instr,
-            o_compressed_o = trace_if.compressed,
-        )
+        self.cpu_params.update(i_rst_ni=~(ResetSignal("sys") | dm.ndmreset))
 
     def set_reset_address(self, reset_address):
-        assert not hasattr(self, "reset_address")
         self.reset_address = reset_address
         self.cpu_params.update(i_boot_addr_i=Signal(32, reset=reset_address))
 
     def do_finalize(self):
         assert hasattr(self, "reset_address")
-        self.specials += Instance("riscv_core", **self.cpu_params)
+        self.specials += Instance("cv32e40p_core", **self.cpu_params)

@@ -13,7 +13,7 @@ import argparse
 import os
 import sys
 import socket
-import time
+import signal
 import threading
 
 from litex.tools.remote.etherbone import EtherbonePacket, EtherboneRecord, EtherboneWrites
@@ -21,7 +21,7 @@ from litex.tools.remote.etherbone import EtherboneIPC
 
 # Read Merger --------------------------------------------------------------------------------------
 
-def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
+def _read_merger(addrs, max_length=255, bursts=None):
     """Sequential reads merger
 
     Take a list of read addresses as input and merge the sequential/fixed reads in (base, length, burst) tuples:
@@ -31,7 +31,19 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
     most of the access delay and allows minimizing number of commands by grouping them in UARTBone
     packets.
     """
-    assert "incr" in bursts
+    bursts = ["incr", "fixed"] if bursts is None else bursts
+
+    if max_length <= 0:
+        raise ValueError("max_length must be greater than 0.")
+    if "incr" not in bursts:
+        raise ValueError("Read merger requires incr burst support.")
+    for burst in bursts:
+        if burst not in ["incr", "fixed"]:
+            raise ValueError("Unsupported burst mode: {}".format(burst))
+
+    if not addrs:
+        return
+
     burst_base   = addrs[0]
     burst_length = 1
     burst_type   = "incr"
@@ -40,7 +52,7 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
         # Try to merge to a "fixed" burst if supported
         if ("fixed" in bursts):
             # If current burst matches
-            if (burst_type in [None, "fixed"]) or (burst_length == 1):
+            if (burst_type == "fixed") or (burst_length == 1):
                 # If addr matches
                 if (addr == burst_base):
                     if (burst_length != max_length):
@@ -51,7 +63,7 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
         # Try to merge to an "incr" burst if supported
         if ("incr" in bursts):
             # If current burst matches
-            if (burst_type in [None, "incr"]) or (burst_length == 1):
+            if (burst_type == "incr") or (burst_length == 1):
                 # If addr matches
                 if (addr == burst_base + (4 * burst_length)):
                     if (burst_length != max_length):
@@ -70,21 +82,38 @@ def _read_merger(addrs, max_length=256, bursts=["incr", "fixed"]):
 # Remote Server ------------------------------------------------------------------------------------
 
 class RemoteServer(EtherboneIPC):
-    def __init__(self, comm, bind_ip, bind_port=1234):
-        self.comm      = comm
-        self.bind_ip   = bind_ip
-        self.bind_port = bind_port
-        self.lock      = False
+    def __init__(self, comm, bind_ip, bind_port=1234, addr_width=32):
+        self.comm       = comm
+        self.bind_ip    = bind_ip
+        self.bind_port  = bind_port
+        self.lock       = threading.Lock()
+        self.addr_width = addr_width
+        self.addr_size  = self.addr_width // 8
+
+        comm_name = comm.__class__.__name__
+        self.read_max_length = {
+            "CommUART": 255,
+            "CommUDP":    1,
+        }.get(comm_name, 1)
+        self.read_bursts = {
+            "CommUART": ["incr", "fixed"]
+        }.get(comm_name, ["incr"])
 
     def open(self):
         if hasattr(self, "socket"):
             return
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # SO_REUSEADDR allows an immediate restart after an unclean termination. SO_REUSEPORT is not
+        # set: it would let a second server bind the same port and share the clients between bridges.
         if hasattr(socket, "SO_REUSEADDR"):
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if hasattr(socket, "SO_REUSEPORT"):
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        self.socket.bind((self.bind_ip, self.bind_port))
+        try:
+            self.socket.bind((self.bind_ip, self.bind_port))
+        except OSError as e:
+            self.socket.close()
+            del self.socket
+            raise OSError(e.errno, f"Unable to bind {self.bind_ip}:{self.bind_port} ({e.strerror}), "
+                "another litex_server may already use this port (see --bind-port).") from e
         print("tcp port: {:d}".format(self.bind_port))
         self.socket.listen(1)
         self.comm.open()
@@ -96,61 +125,70 @@ class RemoteServer(EtherboneIPC):
         self.socket.close()
         del self.socket
 
+    def _send_server_info(self, client_socket):
+        # FIXME: Formalize info/improve.
+        info = []
+        info.append(f"{self.comm.__class__.__name__}")
+        info.append(f"{self.bind_ip}")
+        info.append(f"{self.bind_port}")
+        info = ":".join(info)
+        client_socket.sendall(bytes(info, "UTF-8"))
+
+    def _serve_client(self, client_socket):
+        # Serve Etherbone reads/writes.
+        while True:
+            # Receive packet.
+            try:
+                packet = self.receive_packet(client_socket, self.addr_size)
+                if packet == 0:
+                    break
+            except Exception:
+                break
+            # Decode Packet.
+            packet = EtherbonePacket(self.addr_width, packet)
+            packet.decode()
+
+            # Get Packet's Record.
+            record = packet.records.pop()
+
+            # Hardware lock/reservation.
+            with self.lock:
+                # Handle Etherbone writes.
+                if record.writes != None:
+                    self.comm.write(record.writes.base_addr, record.writes.get_datas())
+
+                # Handle Etherbone reads.
+                if record.reads != None:
+                    reads = []
+                    for addr, length, burst in _read_merger(record.reads.get_addrs(),
+                        max_length  = self.read_max_length,
+                        bursts      = self.read_bursts):
+                        reads.extend(self.comm.read(addr, length, burst))
+
+                    record = EtherboneRecord(self.addr_size)
+                    record.writes = EtherboneWrites(addr_size=self.addr_size, datas=reads)
+                    record.wcount = len(record.writes)
+
+                    packet = EtherbonePacket(self.addr_width)
+                    packet.records = [record]
+                    packet.encode()
+                    self.send_packet(client_socket, packet)
+
     def _serve_thread(self):
         while True:
-            client_socket, addr = self.socket.accept()
+            try:
+                client_socket, addr = self.socket.accept()
+            except (OSError, AttributeError):
+                # Listening socket closed (or removed by close()): the server is stopping.
+                break
             print("Connected with " + addr[0] + ":" + str(addr[1]))
             try:
-                while True:
-                    try:
-                        packet = self.receive_packet(client_socket)
-                        if packet == 0:
-                            break
-                    except:
-                        break
-                    packet = EtherbonePacket(packet)
-                    packet.decode()
-
-                    record = packet.records.pop()
-
-                    # Wait for lock
-                    while self.lock:
-                        time.sleep(0.01)
-
-                    # Set lock
-                    self.lock = True
-
-                    # Handle writes:
-                    if record.writes != None:
-                        self.comm.write(record.writes.base_addr, record.writes.get_datas())
-
-                    # Handle reads
-                    if record.reads != None:
-                        max_length = {
-                            "CommUART": 256,
-                            "CommUDP":    1,
-                        }.get(self.comm.__class__.__name__, 1)
-                        bursts = {
-                            "CommUART": ["incr", "fixed"]
-                        }.get(self.comm.__class__.__name__, ["incr"])
-                        reads = []
-                        for addr, length, burst in _read_merger(record.reads.get_addrs(),
-                            max_length  = max_length,
-                            bursts      = bursts):
-                            reads += self.comm.read(addr, length, burst)
-
-                        record = EtherboneRecord()
-                        record.writes = EtherboneWrites(datas=reads)
-                        record.wcount = len(record.writes)
-
-                        packet = EtherbonePacket()
-                        packet.records = [record]
-                        packet.encode()
-                        self.send_packet(client_socket, packet)
-
-                    # release lock
-                    self.lock = False
-
+                self._send_server_info(client_socket)
+                self._serve_client(client_socket)
+            except Exception as e:
+                # A client error (client gone before its response, bridge timeout...) only ends
+                # this client: the thread must keep serving the next ones.
+                print(f"Client error: {type(e).__name__}: {e}")
             finally:
                 print("Disconnect")
                 client_socket.close()
@@ -158,64 +196,85 @@ class RemoteServer(EtherboneIPC):
     def start(self, nthreads):
         for i in range(nthreads):
             self.serve_thread = threading.Thread(target=self._serve_thread)
-            self.serve_thread.setDaemon(True)
+            self.serve_thread.daemon = True
             self.serve_thread.start()
 
 # Run ----------------------------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="LiteX Server utility")
+def _main():
+    parser = argparse.ArgumentParser(description="LiteX Server utility", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # Common arguments
-    parser.add_argument("--bind-ip",         default="localhost",    help="Host bind address")
-    parser.add_argument("--bind-port",       default=1234,           help="Host bind port")
-    parser.add_argument("--debug",           action="store_true",    help="Enable debug")
+    parser.add_argument("--bind-ip",         default="localhost",    help="Host bind address.")
+    parser.add_argument("--bind-port",       default=1234,           help="Host bind port.")
+    parser.add_argument("--addr-width",      default=32,             help="bus address width.")
+    parser.add_argument("--debug",           action="store_true",    help="Enable debug.")
 
     # UART arguments
-    parser.add_argument("--uart",            action="store_true",    help="Select UART interface")
-    parser.add_argument("--uart-port",       default=None,           help="Set UART port")
-    parser.add_argument("--uart-baudrate",   default=115200,         help="Set UART baudrate")
+    parser.add_argument("--uart",            action="store_true",    help="Select UART interface.")
+    parser.add_argument("--uart-port",       default=None,           help="Set UART port.")
+    parser.add_argument("--uart-baudrate",   default=115200,         help="Set UART baudrate.")
 
     # JTAG arguments
-    parser.add_argument("--jtag",            action="store_true",             help="Select JTAG interface")
-    parser.add_argument("--jtag-config",     default="openocd_xc7_ft232.cfg", help="OpenOCD JTAG configuration file")
+    parser.add_argument("--jtag",            action="store_true",             help="Select JTAG interface.")
+    parser.add_argument("--jtag-config",     default="openocd_xc7_ft232.cfg", help="OpenOCD JTAG configuration file.")
+    parser.add_argument("--jtag-chain",      default=1,                       help="JTAG chain.")
+    parser.add_argument("--jtag-port",       default=20000, type=int,         help="OpenOCD JTAG stream port.")
 
     # UDP arguments
-    parser.add_argument("--udp",             action="store_true",    help="Select UDP interface")
-    parser.add_argument("--udp-ip",          default="192.168.1.50", help="Set UDP remote IP address")
-    parser.add_argument("--udp-port",        default=1234,           help="Set UDP remote port")
+    parser.add_argument("--udp",             action="store_true",    help="Select UDP interface.")
+    parser.add_argument("--udp-ip",          default="192.168.1.50", help="Set UDP remote IP address.")
+    parser.add_argument("--udp-port",        default=1234,           help="Set UDP remote port.")
     parser.add_argument("--udp-scan",        action="store_true",    help="Scan network for available UDP devices.")
 
     # PCIe arguments
-    parser.add_argument("--pcie",            action="store_true",    help="Select PCIe interface")
-    parser.add_argument("--pcie-bar",        default=None,           help="Set PCIe BAR")
+    parser.add_argument("--pcie",            action="store_true",    help="Select PCIe interface.")
+    parser.add_argument("--pcie-bar",        default=None,           help="Set PCIe BAR.")
 
     # USB arguments
-    parser.add_argument("--usb",             action="store_true",    help="Select USB interface")
-    parser.add_argument("--usb-vid",         default=None,           help="Set USB vendor ID")
-    parser.add_argument("--usb-pid",         default=None,           help="Set USB product ID")
-    parser.add_argument("--usb-max-retries", default=10,             help="Number of USB reconecting retries")
+    parser.add_argument("--usb",             action="store_true",    help="Select USB interface.")
+    parser.add_argument("--usb-vid",         default=None,           help="Set USB vendor ID.")
+    parser.add_argument("--usb-pid",         default=None,           help="Set USB product ID.")
+    parser.add_argument("--usb-max-retries", default=10,             help="Number of USB reconnecting retries.")
+
+    # DevMem arguments
+    parser.add_argument("--devmem",          action="store_true",    help="Select DevMem interface (/dev/mem on a Hard CPU).")
+    parser.add_argument("--devmem-base",     default="0xff200000",   help="Set DevMem window base address.")
+    parser.add_argument("--devmem-size",     default="0x200000",     help="Set DevMem window size.")
     args = parser.parse_args()
 
+    if args.udp_scan:
+        args.udp = True
+    interfaces          = ["uart", "jtag", "udp", "pcie", "usb", "devmem"]
+    selected_interfaces = [name for name in interfaces if getattr(args, name)]
+    if len(selected_interfaces) == 0:
+        parser.error("select one interface: --uart, --jtag, --udp, --udp-scan, --pcie, --usb or --devmem.")
+    if len(selected_interfaces) > 1:
+        parser.error("select only one interface (got: {}).".format(
+            ", ".join("--" + name for name in selected_interfaces)))
 
+    jtag_uart = None
     # UART mode
     if args.uart:
         from litex.tools.remote.comm_uart import CommUART
         if args.uart_port is None:
-            print("Need to specify --uart-port, exiting.")
-            exit()
+            parser.error("--uart requires --uart-port.")
         uart_port = args.uart_port
         uart_baudrate = int(float(args.uart_baudrate))
         print("[CommUART] port: {} / baudrate: {} / ".format(uart_port, uart_baudrate), end="")
-        comm = CommUART(uart_port, uart_baudrate, debug=args.debug)
+        comm = CommUART(uart_port, uart_baudrate, debug=args.debug, addr_width=int(args.addr_width))
 
     # JTAG mode
     elif args.jtag:
         from litex.tools.litex_term import JTAGUART
         from litex.tools.remote.comm_uart import CommUART
-        bridge = JTAGUART(config=args.jtag_config)
-        bridge.open()
+        jtag_uart = JTAGUART(config=args.jtag_config, port=args.jtag_port, chain=int(args.jtag_chain))
+        jtag_uart.open()
         print("[CommUART] port: JTAG / ", end="")
-        comm = CommUART(os.ttyname(bridge.name), debug=args.debug)
+        try:
+            comm = CommUART(os.ttyname(jtag_uart.name), debug=args.debug, addr_width=int(args.addr_width))
+        except BaseException:
+            jtag_uart.close()
+            raise
 
     # UDP mode
     elif args.udp:
@@ -224,25 +283,25 @@ def main():
         udp_port = int(args.udp_port)
         if args.udp_scan:
             udp_ip = udp_ip.split(".")
-            assert len(udp_ip) == 4
+            if len(udp_ip) != 4:
+                parser.error("--udp-scan requires --udp-ip to contain four octets.")
             udp_ip[3] = "x"
             udp_ip = ".".join(udp_ip)
-            comm = CommUDP(udp_ip, udp_port, debug=args.debug)
+            comm = CommUDP(udp_ip, udp_port, debug=args.debug, addr_width=int(args.addr_width))
             comm.open(probe=False)
             comm.scan(udp_ip)
             comm.close()
-            exit()
+            return
         else:
             print("[CommUDP] ip: {} / port: {} / ".format(udp_ip, udp_port), end="")
-            comm = CommUDP(udp_ip, udp_port, debug=args.debug)
+            comm = CommUDP(udp_ip, udp_port, debug=args.debug, addr_width=int(args.addr_width))
 
     # PCIe mode
     elif args.pcie:
         from litex.tools.remote.comm_pcie import CommPCIe
         pcie_bar = args.pcie_bar
         if pcie_bar is None:
-            print("Need to speficy --pcie-bar, exiting.")
-            exit()
+            parser.error("--pcie requires --pcie-bar.")
         print("[CommPCIe] bar: {} / ".format(pcie_bar), end="")
         comm = CommPCIe(pcie_bar, debug=args.debug)
 
@@ -250,8 +309,7 @@ def main():
     elif args.usb:
         from litex.tools.remote.comm_usb import CommUSB
         if args.usb_pid is None and args.usb_vid is None:
-            print("Need to speficy --usb-vid or --usb-pid, exiting.")
-            exit()
+            parser.error("--usb requires --usb-vid and/or --usb-pid.")
         print("[CommUSB] vid: {} / pid: {} / ".format(args.usb_vid, args.usb_pid), end="")
         pid = args.usb_pid
         if pid is not None:
@@ -261,18 +319,41 @@ def main():
             vid = int(vid, base=0)
         comm = CommUSB(vid=vid, pid=pid, max_retries=args.usb_max_retries, debug=args.debug)
 
-    else:
-        parser.print_help()
-        exit()
+    # DevMem mode
+    elif args.devmem:
+        from litex.tools.remote.comm_devmem import CommDevMem
+        devmem_base = int(args.devmem_base, base=0)
+        devmem_size = int(args.devmem_size, base=0)
+        print("[CommDevMem] base: 0x{:08x} / size: 0x{:08x} / ".format(devmem_base, devmem_size), end="")
+        comm = CommDevMem(base=devmem_base, size=devmem_size, debug=args.debug)
 
-    server = RemoteServer(comm, args.bind_ip, int(args.bind_port))
-    server.open()
-    server.start(4)
+    server = None
     try:
+        server = RemoteServer(comm, args.bind_ip, int(args.bind_port), addr_width=int(args.addr_width))
+        server.open()
+        server.start(4)
         import time
         while True: time.sleep(100)
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            if server is not None:
+                server.close()
+        finally:
+            if jtag_uart is not None:
+                jtag_uart.close()
+
+
+def main():
+    def terminate(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        _main()
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 if __name__ == "__main__":
     main()

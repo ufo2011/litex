@@ -5,12 +5,20 @@ from litex.soc.cores.clock.xilinx_us  import USPLL,  USMMCM,  USIDELAYCTRL
 from litex.soc.cores.clock.xilinx_usp import USPPLL, USPMMCM, USPIDELAYCTRL
 
 # Intel
+from litex.soc.cores.clock.intel_agilex    import Agilex3PLL, Agilex5PLL, Agilex7PLL
 from litex.soc.cores.clock.intel_max10     import Max10PLL
 from litex.soc.cores.clock.intel_cyclone4  import CycloneIVPLL
 from litex.soc.cores.clock.intel_cyclone5  import CycloneVPLL
 from litex.soc.cores.clock.intel_cyclone10 import Cyclone10LPPLL
+from litex.soc.cores.clock.intel_common    import IntelPLLPhaseStepper
 
 # Lattice
 from litex.soc.cores.clock.lattice_ice40 import iCE40PLL
-from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL
+from litex.soc.cores.clock.lattice_ecp5  import ECP5PLL, ECP5DynamicDelay
 from litex.soc.cores.clock.lattice_nx    import NXOSCA, NXPLL
+
+# Efinix
+from litex.soc.cores.clock.efinix import TRIONPLL, TITANIUMPLL, TITANIUMOSC
+
+# CologneChip
+from litex.soc.cores.clock.colognechip import GateMatePLL

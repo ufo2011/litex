@@ -1,0 +1,313 @@
+A map of LiteX for a software agent asked to work *in* LiteX (fix, extend, review the
+framework or a core) or *with* it (build a SoC, bring up a board, write firmware, drive a
+board from the host), and what we ask in return: [send back](#contribute-back) what you had
+to fix or add. The facts come from the code; when this page and the code disagree, the code
+is right and this page needs a [pull request](Contributing-to-the-Wiki.md).
+
+**Machine-readable index of this wiki:** [llms.txt](https://raw.githubusercontent.com/wiki/enjoy-digital/litex/llms.txt)
+(one line per page); the raw markdown of a page is at
+`https://raw.githubusercontent.com/wiki/enjoy-digital/litex/<Page-Name>.md`. The sources
+of the pages are in [`doc/wiki/`](https://github.com/enjoy-digital/litex/tree/master/doc/wiki)
+of the repository. [DeepWiki](https://deepwiki.com/enjoy-digital/litex) indexes the code.
+
+## LiteX in ten lines
+
+1. LiteX builds FPGA SoCs and cores in Python: Migen describes the logic, LiteX provides the
+   SoC builder, the interconnect, the cores, the build backends, the BIOS/software support and
+   the host tools ([Home](Home.md), [The LiteX approach](LiteX-Approach.md)).
+2. A design is a *platform* (the board: pins, clocks, toolchain) and a *target* (the SoC):
+   `python3 target.py --build --load`, then `litex_term /dev/ttyUSBx` ([SoC builder](SoC-builder.md)).
+3. `SoCCore` adds the CPU, ROM (with the BIOS), SRAM, UART, timer; `add_sdram`,
+   `add_ethernet`, `add_pcie`, `add_sdcard`, `add_spi_flash`... add the ecosystem cores.
+4. Cores talk through [streams](Streams.md), [Wishbone](Wishbone-Bus.md)/[AXI](AXI-Bus.md)
+   buses and [CSRs](CSR-Bus.md); a core is a `LiteXModule` with `CSRStorage`/`CSRStatus`
+   attributes and an `EventManager` for interrupts; the SoC derives `csr.h`, `csr.csv`,
+   `csr.json`, `csr.svd`, the device trees and the documentation from it.
+5. The Builder generates `build/<platform>/gateware/` (Verilog, constraints, toolchain script)
+   and `build/<platform>/software/` (headers, BIOS); `--no-compile-gateware` skips the
+   toolchain, `--no-compile` skips everything but the generation.
+6. The BIOS boots the application from serial, flash, ROM, SD card, SATA or TFTP
+   ([BIOS](BIOS.md), [Write firmware for your SoC](Write-Firmware-For-Your-SoC.md)).
+7. The host reaches the running SoC's bus through a [bridge](Host-Bridges.md) (UART, JTAG,
+   Ethernet, PCIe): `litex_server` + `litex_cli`/`RemoteClient`, LiteScope for signals.
+8. `litex_sim` runs the same SoC in Verilator ([SoC-Simulator](SoC-Simulator.md)); unit tests
+   use the Migen simulator and `pytest`.
+9. 32 soft CPUs and 7 hard ones ([CPUs](CPUs.md), [Choosing a CPU](Choosing-A-CPU.md)), 9 FPGA
+   vendors ([Build backends](Build-Backends.md)), 250+ boards (LiteX-Boards), the cores in their
+   own repositories ([Cores ecosystem](Cores-Ecosystem.md)).
+10. BSD-2-Clause; development on `master`; releases `YYYY.04/.08/.12` ([CHANGES.md](https://github.com/enjoy-digital/litex/blob/master/CHANGES.md)).
+
+## Repository map
+
+```
+litex/                              https://github.com/enjoy-digital/litex
+  litex_setup.py, litex_repos.py    install/update the ecosystem; the repository catalog and configs
+  litex/gen/                        LiteXModule, genlib (CDC, misc), fhdl (Verilog generation, Instance, memory, hierarchy)
+  litex/build/                      generic_platform.py (Pins/IOStandard/Subsignal, request), generic_toolchain.py, parser.py (LiteXArgumentParser),
+                                    io.py (generic specials), <vendor>/ (xilinx, altera, lattice, gowin, efinix, colognechip, microsemi, quicklogic, anlogic),
+                                    sim/ (Verilator, C models, QEMU co-sim), openfpgaloader.py, openocd.py, dfu.py, vhd2v_converter.py, amaranth2v_converter.py, bundle.py
+  litex/soc/interconnect/           stream.py, packet.py, wishbone.py, axi/, avalon/, ahb.py, csr.py, csr_bus.py, csr_eventmanager.py
+  litex/soc/cores/                  the in-tree cores; clock/ (PLLs per vendor); cpu/<name>/core.py (the CPU wrappers, + crt0.S, irq.h)
+  litex/soc/integration/            soc.py (SoC, LiteXSoC, SoCCore, SoCMini, the handlers, add_*), builder.py (Builder), export.py (csr.h/csv/json/svd), doc.py
+  litex/soc/software/               bios/, libbase/, libc (picolibc), liblitedram/, libliteeth/, liblitesdcard/, liblitesata/, liblitespi/, demo/, include/generated/ (per build)
+  litex/soc/doc/                    the Sphinx documentation generator
+  litex/tools/                      litex_term, litex_server, litex_client (litex_cli), litex_jtag, litex_sim, litex_soc_gen, litex_periph_gen,
+                                    litex_json2dts_linux/zephyr, litex_json2renode, litex_read_verilog, litex_build_bundle, litex_remote_build, remote/ (the transports)
+  doc/                              coding_style.md, architectural_style.md, release_process.md, socdoc.md, bios_config.md, cpu_jtag_debug.md, stream_byte_enables.md, uninstall.md,
+                                    wiki/ (this wiki), diagrams/ (the diagram generator), wiki_sync.py
+  test/                             pytest: cores/, interconnect/, soc/ (test_integration.py boots the BIOS on every CPU in Verilator), tools/, software/
+  prog/                             OpenOCD configurations
+  CHANGES.md, CONTRIBUTORS, setup.py (console_scripts, python_requires ~=3.7)
+
+../litex-boards/litex_boards/       platforms/<vendor>_<board>.py, targets/<vendor>_<board>.py, extensions/ (Pmods, FMC...), prog/
+../litedram, liteeth, litepcie, ... one repository per core: <core>/{phy,core,frontend,software}/, gen.py, test/, doc/, examples/
+../pythondata-cpu-<name>/           the packaged sources of a CPU (litex-hub)
+```
+
+## Where the key things are
+
+| You need | Look at |
+| --- | --- |
+| How a target is written | any `litex_boards/targets/*.py`; [Create a minimal SoC](Create-A-minimal-SoC.md) |
+| The `add_*` helpers and their arguments | `litex/soc/integration/soc.py` (`LiteXSoC`); [SoC builder reference](SoC-Builder-Reference.md) |
+| The options of a SoC and of the Builder | `soc_core_args()` in `soc.py`, `builder_args()` in `builder.py`; `target.py --help` |
+| A CPU's variants, buses, flags | `litex/soc/cores/cpu/<name>/core.py` (`CPU_VARIANTS`, `GCC_FLAGS`, `periph_buses`) |
+| A core's registers and interrupts | its `CSRStorage`, `CSRStatus` and `EventManager` attributes; the `csr.h` and `csr.csv` of a build |
+| The generated outputs of a build | `build/<platform>/{csr.csv,csr.json,litex.log,gateware/,software/include/generated/}` |
+| The BIOS commands and boot methods | `litex/soc/software/bios/{main.c,boot.c,cmds/}`; [BIOS](BIOS.md) |
+| How a vendor toolchain is driven | `litex/build/<vendor>/<toolchain>.py` (`build_project`, `build_script`, `run_script`) |
+| The host-side API | `litex/tools/litex_client.py` (`RemoteClient`), `litex/tools/remote/comm_*.py` |
+| What changed recently | `CHANGES.md` (per release, with commit links) |
+
+## Commands that answer questions fast
+
+```sh
+python3 target.py --help                                           # every option of a target, with defaults
+python3 target.py --build --no-compile --output-dir=/tmp/x         # the map, CSRs, IRQs and generated files in seconds, no toolchain, no gcc
+python3 target.py --build --no-compile-gateware                    # + the BIOS and headers (needs the CPU's gcc and meson)
+litex_sim --cpu-type=vexriscv [--with-sdram --with-ethernet ...]   # the SoC in Verilator, BIOS prompt in the terminal
+python3 -m pytest test/cores/test_pwm.py                           # one test; test/ holds the suite (slow: test/soc/test_integration.py)
+python3 -c "from litex.soc.cores.cpu import CPUS; print(sorted(k for k in CPUS if k))"   # the CPU registry
+litex_cli --csr-csv build/<board>/csr.csv --regs                   # the registers of a running board (through litex_server)
+litex_cli --csr-csv build/<board>/csr.csv --regs --json            # the same as one JSON object; errors as {"error": ...}, exit code 1
+./litex_setup.py --freeze                                          # the commit of every installed repository
+```
+
+Reading the generated `csr.csv`/`csr.json`/`litex.log` of a `--no-compile` build is the
+fastest way to check what a target or an option really produces.
+
+## Conventions
+
+- **Style**: [doc/coding_style.md](https://github.com/enjoy-digital/litex/blob/master/doc/coding_style.md)
+  (file header with the SPDX line, section banners `# Name ----`, the `# # #` separator
+  between a module's interface and its implementation, aligned argument blocks, HDL
+  star-imports in HDL modules only; it has a "Guidance for AI agents" section: inspect
+  neighboring files first, keep edits scoped, run the smallest useful check, report what
+  could not be run).
+- **Architecture**: [doc/architectural_style.md](https://github.com/enjoy-digital/litex/blob/master/doc/architectural_style.md):
+  protocol logic in the core, vendor primitives in a device adapter, pins and clocks in the
+  platform/target; a new device is a new adapter, not a copy of the protocol; keep public
+  class names, constructor arguments, CSR layouts, clock domain names and command-line options
+  (or provide a compatibility path).
+- **Commits**: `module: Description of the change.` (`litex/soc/cores/uart: Fix RX FIFO
+  overflow.`), one change per commit, the pull request says what was tested and on which
+  hardware.
+- **Tests**: a unit test in `test/` for new logic; CI runs `pytest` on every push and boots
+  the BIOS on every CPU in Verilator; `litex_hw_ci` runs designs on real boards.
+- **Generated files are never edited**: `build/`, `csr.h`, `.init` files, the Verilog;
+  change the Python.
+- **Do not bump dependencies, rename options or reformat unrelated code** in a fix.
+
+## How to verify a change
+
+1. Elaborate: a `--build --no-compile` of a target that uses the code (or `litex_sim`
+   `--no-compile-gateware`) proves the Python and the Verilog generation; a Python import
+   alone proves nothing.
+2. Simulate: the relevant `test/` files; `litex_sim` for anything the BIOS exercises (a
+   memory, a UART, a timer, a DRAM, Ethernet with `--with-ethernet` and a TAP).
+3. Build: one real target with the toolchain when it is available (`--build`), look at the
+   timing report; several variants/vendors when the change touches a backend or a PHY.
+4. Hardware: say in the pull request what ran on a board and what did not; simulation and
+   elaboration cannot establish analog behavior or timing closure.
+
+## Pitfalls
+
+- Options use dashes (`--uart-name`, `--cpu-variant`), integers for sizes and baudrates
+  (`--uart-baudrate=1000000`, `--integrated-main-ram-size=0x10000`); variant names are
+  exact keys of the CPU's list (`standard+debug` exists for `vexriscv`, not for `serv`).
+- `litex_cli`/`litex_term --crossover`/`litescope_cli` read `csr.csv` from the current
+  directory unless `--csr-csv` is given; the Builder always writes it in `build/<platform>/`.
+- A system Python refuses `pip` installs (PEP 668): use a venv for `litex_setup.py`.
+- `litex_sim --with-ethernet`/`--with-etherbone` creates a TAP interface and needs `sudo`;
+  Verilator builds take a minute and need `libevent-dev libjson-c-dev`.
+- The generated CPUs (`vexriscv_smp`, `naxriscv`, `vexiiriscv`) need Java/sbt the first time;
+  `coreblocks` needs Python 3.13 to elaborate; `rocket` needs lots of RAM.
+- The ROM is auto-resized to the BIOS; `--no-integrated-rom-auto-size` and the `BIOS_ROM_BUDGET`
+  variable are the knobs when the size matters; `--bios-console lite --libc-mode minimal`
+  shrink it.
+- Uncached peripherals must live in the CPU's IO regions (`0x80000000`+ on most 32-bit soft
+  cores); the handler raises a clear error otherwise.
+- The vendor toolchains are found through the `PATH` or `LITEX_ENV_VIVADO`/`LITEX_ENV_ISE`/`LITEX_ENV_EFINITY`;
+  OpenOCD configurations are in `prog/`.
+- The wiki, `CHANGES.md` and the READMEs describe `master`; a release tag may lack the newest
+  options.
+
+## Using LiteX from a project, as an agent
+
+```sh
+python3 -m venv ~/litex-venv && source ~/litex-venv/bin/activate
+wget https://raw.githubusercontent.com/enjoy-digital/litex/master/litex_setup.py && chmod +x litex_setup.py
+./litex_setup.py --init --install --config=standard && ./litex_setup.py --gcc=riscv && pip3 install meson ninja
+```
+
+Then a target file (copy the closest LiteX-Boards target, or the [40-line one](Create-A-minimal-SoC.md)),
+`--build --no-compile` to check the map, `--build --load` when the toolchain is there,
+`litex_term` for the console (without a terminal: `litex_term <port> --send help --send ident
+--json` returns each command's output up to the `litex>` prompt, `--expect <regex>` waits for
+something else, exit code 2 on timeout), `--with-uartbone`/`--with-etherbone` + `litex_server` +
+`RemoteClient` to script the board from Python, [LiteScope](Use-LiteScope-To-Debug-A-SoC.md)
+to see signals, `litex_bare_metal_demo` as the firmware template. For a core that must exist
+in a non-LiteX design, the generators ([Export](Export-To-Verilog.md)). Two projects where an
+agent did this end to end, a 64-bit CPU swapped into a LiteX SoC and an accelerator's memory
+path moved from the Xilinx MIG to LiteDRAM, are on
+[Projects](Projects.md#projects-built-with-ai-agents), with what they reached for and why.
+
+## Drive a SoC through MCP
+
+`litex_mcp` is a [Model Context Protocol](https://modelcontextprotocol.io) server that gives an
+agent typed tools on a running SoC, through any `litex_server` bridge: `litex_check` (link,
+identifier, read round-trip), `litex_ident`, `litex_list_registers`, `litex_list_memory_regions`,
+`litex_list_constants`, `litex_read_register`, `litex_read_registers`, `litex_read_memory`, and,
+only when started with `--allow-write`, `litex_write_register` and `litex_write_memory`;
+`litex_connect` switches to another server or CSR file. Without a board, `litex_list_boards`,
+`litex_board_info` (FPGA device, platform, the target's options by group), `litex_list_cpus` (with
+their variants) and `litex_list_cores` answer "which command line for this board and these cores".
+Every tool is annotated read-only or not (destructive for the writes), so the client can ask for
+approval on the side effects only. It needs the MCP Python SDK (`pip3 install mcp`, Python >= 3.10);
+the rest of LiteX does not.
+
+```sh
+litex_server --uart --uart-port=/dev/ttyUSB1                       # or --jtag, --udp, --pcie...
+litex_mcp --csr-csv=build/<board>/csr.csv --port=1234              # stdio server, register it in the agent's MCP configuration
+```
+
+Without a board, the same loop runs against a simulated SoC, with no TAP interface and no `sudo`:
+
+```sh
+litex_sim --uart-name=crossover+uartbone --uart-tcp --uart-tcp-port=2345 --output-dir=build/sim
+litex_server --uart --uart-port=socket://localhost:2345 --bind-port=1240
+litex_mcp --csr-csv=build/sim/csr.csv --port=1240
+```
+
+Call `litex_check` first: it shows which SoC answers on the port before anything is read or written.
+What a project learns this way (the commands, the expected identifier, the registers and probes
+that matter, the failures already understood) goes in its `doc/debugging-guide.md`, started from
+the [debugging guide template](Debugging-Guide-Template.md).
+
+The server can also run this loop itself, as background jobs: `litex_sim_start` (options of
+`litex_sim`, the console in the job log), `litex_job_wait` (until a regex such as the `litex>`
+prompt, the end of the job or a timeout), `litex_job_status`, `litex_job_stop` (the job and all its
+children), `litex_list_jobs`, and `litex_server_start`, which refuses a port already in use and
+waits for a simulated UART to listen. Then `litex_connect` to the new server and CSR file.
+
+Builds follow the same pattern: `litex_build_start` runs a LiteX-Boards target (or a target script)
+with `--build` as a job, and `litex_build_report` returns the result as data instead of the log:
+timing met or not, WNS/TNS, per-clock results, the failing (or worst) paths, the utilization and the
+error lines (Vivado, Quartus, Gowin, Efinity and nextpnr reports; parsers in
+`litex/build/report.py`). `--load` and
+`--flash` are only accepted with `--allow-write`.
+
+Every build (including `--no-compile`) writes `build_info.json` next to `csr.csv`: the command
+line, the platform/device/toolchain, the CPU, `sys_clk_freq`, the LiteX (and loaded cores) Git
+revisions, the generated files (CSR maps, bitstream, BIOS, log, LiteScope `analyzer.csv`) and the build status (`running`,
+`succeeded`, `failed`; `run: false` when only the files were generated). `litex_build_info` returns
+it, `litex_build_report` includes it (builds started by `litex_build_start` run from their output
+directory, so `analyzer.csv` lands there), and the CSR maps and `build_info.json` of the selected SoC are
+also MCP resources (`litex://soc/csr.csv`, `litex://soc/csr.json`, `litex://soc/build_info.json`).
+
+With a LiteScope analyzer in the design, `litex_scope_list` gives its groups and signals (from the
+build's `analyzer.csv`) and `litex_scope_capture` sets the triggers (rising, falling, value), arms,
+waits (with a timeout) and returns the capture as data: per signal, the value at the trigger, the
+number of transitions and the first changes, plus a VCD file of the whole capture.
+`litex_sim_start(["--with-analyzer", ...])` generates `analyzer.csv` before the simulation runs.
+
+With a crossover UART (`--uart-name=crossover` or `crossover+uartbone`), `litex_console_read`
+returns what the SoC printed and `litex_console_command` (with `--allow-write`: BIOS commands can
+write memory or flash) sends a command line and returns the output up to the `litex>` prompt.
+
+## Agent skills
+
+Six procedures in the [Agent Skills](https://agentskills.io) format, in
+[`doc/agent/skills/`](https://github.com/enjoy-digital/litex/tree/master/doc/agent/skills):
+`litex-build-and-load`, `litex-bringup`, `litex-csr-debug`, `litescope-capture`,
+`litex-timing-triage` and `litex-upstream-a-fix`. Each is a short `SKILL.md` whose description says
+when it applies, with the commands, the `litex_mcp` tools, the pitfalls and the pages of this wiki
+behind them. In Claude Code:
+
+```
+/plugin marketplace add enjoy-digital/litex
+/plugin install litex@litex
+```
+
+Other agents read the `SKILL.md` files directly (the root `AGENTS.md` points to them).
+
+## Contribute back
+
+LiteX got where it is because the people who used it sent back what they had to fix or add
+for their own project: a PHY, a CPU wrapper, a board target, a BIOS feature, a bus fix. Most
+of the cores ecosystem started that way. The deal does not change when the work is done by an
+agent: if the project you work on made you customize LiteX, send the customization upstream.
+
+It matters more now, not less. A patched target, a copied controller or a wrapper kept in a
+project tree serves that project only; the next agent on the next project rediscovers the same
+fix from scratch, and LiteX drifts away from what runs on real boards. A fix merged upstream
+is picked up by every design that follows, is run by the CI and on the hardware CI, and is
+part of the tree the next agent reads. This loop is how the project improves, and how the
+next, more ambitious agent-driven project starts from a better base instead of reinventing
+the previous one.
+
+What to send back, with examples taken from the agent-built projects on
+[Projects](Projects.md):
+
+- a board target that only used four of its nine DRAM lanes: fix the target in LiteX-Boards;
+- write leveling for banks without ODELAY: a PHY variant next to the existing ones in LiteDRAM;
+- pipelined CSRs that close timing in a controller: an option of the core;
+- a CPU wrapper: a `core.py` in `litex/soc/cores/cpu/` with its pythondata package, like the
+  other external CPUs;
+- a BIOS bug found in simulation: a commit in `litex/soc/software/bios/`.
+
+What stays in the project: a copy tuned for one traffic pattern, a change that helps one
+design only. When unsure, open an issue with the diff and ask.
+
+- **One topic per pull request**, against the repository it belongs to (LiteX, LiteX-Boards,
+  LiteDRAM, LiteEth...), in the [conventions](#conventions) above and
+  [verified](#how-to-verify-a-change) as described, with the board or the simulation it ran
+  on. A reviewer must get it in two minutes: what it fixes, how it was checked, what changes
+  for others.
+- **Say that an agent wrote it**, and who supervised. Not to be judged differently, but so
+  that the review asks the right questions: a confident description is not a test report.
+- **Fix the cause rather than subclass around it**: a subclass that works around a limitation
+  is the sign that the limitation should go, for everyone.
+- **The direction stays human.** What goes in the tree, how it is shaped and how it
+  integrates with the rest is decided by the maintainers, as for any contribution; the
+  foundations have to stay coherent precisely because what is built on them gets more
+  ambitious. An agent proposes, with evidence; the discussion happens in the pull request,
+  and a "no" with a reason is a normal answer.
+
+This is open source as it has always worked. The contributor being an agent changes the
+tooling, not the deal. [Feedback, contribution, support](Feedback-Contribution-Support.md)
+has the mechanics of issues and pull requests.
+
+## The pages of this wiki
+
+The index with one line per page is [llms.txt](https://raw.githubusercontent.com/wiki/enjoy-digital/litex/llms.txt);
+the sidebar gives the reading order, from the six-page path of "Start here" to the reference
+pages, and every page ends with a `## Next` section.
+
+## Next
+
+- [Feedback, contribution, support](Feedback-Contribution-Support.md): issues and pull requests, the mechanics.
+- [Contributing to the wiki](Contributing-to-the-Wiki.md): the shape and the voice of a page, the checks.
+- [SoC builder reference](SoC-Builder-Reference.md): every argument and helper, with defaults.
+- [Create a minimal SoC](Create-A-minimal-SoC.md): the forty lines to start a task from.
+- [Projects](Projects.md#projects-built-with-ai-agents): what other agents built with LiteX.

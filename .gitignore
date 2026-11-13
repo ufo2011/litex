@@ -14,6 +14,8 @@ __pycache__/
 env/
 build/
 !litex/build
+!test/build/
+!test/build/*.py
 develop-eggs/
 dist/
 downloads/
@@ -48,6 +50,10 @@ nosetests.xml
 coverage.xml
 *,cover
 .hypothesis/
+
+# LiteX release state
+.litex_release_*.json
+.litex_release_dist/
 
 # Translations
 *.mo
@@ -91,3 +97,13 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# VS Code settings
+.vscode
+
+# CPU sources downloaded at build/test time (litex/soc/cores/cpu/*/core.py).
+litex/soc/cores/cpu/neorv32/*.vhd
+litex/soc/cores/cpu/neorv32/sources/
+/femtorv32_*.v
+/firev.v
+/mdu_top.v

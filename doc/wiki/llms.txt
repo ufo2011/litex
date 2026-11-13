@@ -1,0 +1,120 @@
+# LiteX
+
+> LiteX is a Python framework (built on Migen) to create FPGA cores and SoCs: a SoC builder with
+> Wishbone/AXI/CSR interconnect and streams, in-tree cores, soft and hard CPUs, build backends for
+> the vendor and open-source FPGA toolchains and for Verilator, a BIOS and software support, host
+> bridges and debug tools, plus an ecosystem of cores (LiteDRAM, LiteEth, LitePCIe, LiteSATA,
+> LiteSDCard, LiteICLink, LiteJESD204, LiteSPI, LiteI2C, LiteScope). BSD-2-Clause, by
+> Enjoy-Digital and the LiteX community. Repository: https://github.com/enjoy-digital/litex
+
+This file indexes the LiteX wiki. The raw markdown of a page is at
+https://raw.githubusercontent.com/wiki/enjoy-digital/litex/<Page-Name>.md (sources: doc/wiki/ in
+the repository). Every page opens with what you get and ends with a Next section.
+
+## Start here
+
+- [Home](https://github.com/enjoy-digital/litex/wiki/Home): the landing page: what LiteX is, the design flow, try it in ten minutes, the six-page path, the map of the wiki
+- [Installation](https://github.com/enjoy-digital/litex/wiki/Installation): install LiteX with litex_setup.py (venv, configs minimal/standard/full, --gcc, --update/--tag), build a board target or litex_sim, uninstall, troubleshooting
+- [Create-A-minimal-SoC](https://github.com/enjoy-digital/litex/wiki/Create-A-minimal-SoC): walk-through: litex_sim, the simple target on any board, a 40-line target file explained, building without the toolchain (real log and output tree), building/loading/talking to it, growing it
+- [Write-Firmware-For-Your-SoC](https://github.com/enjoy-digital/litex/wiki/Write-Firmware-For-Your-SoC): write, build and load your firmware: the bare-metal demo, the generated headers, interrupts, loading over serial, TFTP, SD card, SPI flash or ROM
+- [Host-Bridges](https://github.com/enjoy-digital/litex/wiki/Host-Bridges): control and debug the SoC from the host: UARTBone/JTAGBone/Etherbone/PCIe bridges, litex_server, litex_cli, Python scripts with RemoteClient, the protocols
+- [Use-LiteScope-To-Debug-A-SoC](https://github.com/enjoy-digital/litex/wiki/Use-LiteScope-To-Debug-A-SoC): capture internal signals with the LiteScope logic analyzer through a bridge
+- [Debug-With-GDB](https://github.com/enjoy-digital/litex/wiki/Debug-With-GDB): debug the CPU with GDB over JTAG: VexRiscv-SMP/NaxRiscv/VexiiRiscv in simulation, with a JTAG cable, through BSCANE2 or litex_jtag over any bridge; the VexRiscv +debug variant with SpinalHDL's OpenOCD
+- [Debug-A-SoC-On-Hardware](https://github.com/enjoy-digital/litex/wiki/Debug-A-SoC-On-Hardware): the method to find why a design misbehaves on a board: check the link first, registers before traces, narrow LiteScope captures, reading the generated Verilog and timing reports, testing from the inside out, regression tests and write-ups
+- [Debugging-Guide-Template](https://github.com/enjoy-digital/litex/wiki/Debugging-Guide-Template): a doc/debugging-guide.md template for board and product repositories: build and load commands, connection and expected identifier, known-good registers, instrumentation (registers, LiteScope probes, scripts), simulation and tests, known failures, a dated log
+
+## Build your SoC
+
+- [Add-A-New-Board](https://github.com/enjoy-digital/litex/wiki/Add-A-New-Board): the platform file (resources, Pins/IOStandard/Subsignal, connectors and extensions, vendor platform classes and device strings, programmer, vendor commands), smoke test with the simple target, the target file (CRG, BaseSoC with DRAM/Ethernet/flash, options, main), bring-up order, contributing to LiteX-Boards
+- [Add-A-New-Core](https://github.com/enjoy-digital/litex/wiki/Add-A-New-Core): writing a core (LiteXModule, CSRs, EventManager, streams, bus), simulating it with the Migen simulator, adding it to a SoC, using it from C and from the host, where to put it and how to contribute it
+- [Add-A-New-CPU](https://github.com/enjoy-digital/litex/wiki/Add-A-New-CPU): the CPU directory (core.py, crt0.S, irq.h, system.h), the wrapper class and the attributes the SoC builder reads, the sources (pythondata packages, downloaded, generated), the software side, testing and contributing; out-of-tree CPUs
+- [Reuse-An-Existing-Core](https://github.com/enjoy-digital/litex/wiki/Reuse-An-Existing-Core): integrating an existing Verilog/SystemVerilog/VHDL/Amaranth/SpinalHDL/Chisel core in a LiteX SoC (Instance, litex_read_verilog)
+- [Create-A-Complex-SoC](https://github.com/enjoy-digital/litex/wiki/Create-A-Complex-SoC): the Linux-capable Arty SoC step by step: LiteDRAM, LiteEth, LiteSDCard/SATA, LiteSPI, video, PCIe, what each add_* brings (regions, CSRs, IRQs, BIOS commands, boot methods, Linux drivers), from the SoC to Linux
+- [Create-A-PCIe-SoC](https://github.com/enjoy-digital/litex/wiki/Create-A-PCIe-SoC): LitePCIe (PHYs, endpoint, MMAP, DMAs, MSI, PTM, driver and tools), the target with add_pcie, build/driver/litepcie_util, using the DMAs from the gateware and from liblitepcie, standalone litepcie_gen, examples
+- [Export-To-Verilog](https://github.com/enjoy-digital/litex/wiki/Export-To-Verilog): litex_soc_gen/litex_periph_gen (a SoC as a Verilog module with mmap_s/mmap_m ports), the *_gen generators of the cores (interfaces, configurations, YAML example), the integration checklist, exporting a board target without building
+- [SoC-Simulator](https://github.com/enjoy-digital/litex/wiki/SoC-Simulator): litex_sim: getting started, running firmware, the models (DRAM, Ethernet TAP, SD card, flash, video, JTAG), tracing and GTKWave, bridges in simulation, QEMU co-simulation, other simulators; Renode models of the SoC from csr.json
+- [Load-And-Flash](https://github.com/enjoy-digital/litex/wiki/Load-And-Flash): --load/--flash, openFPGALoader, OpenOCD, the vendor and board-specific programmers, DFU, udev permissions
+- [Use-LiteX-on-the-Acorn-CLE-215](https://github.com/enjoy-digital/litex/wiki/Use-LiteX-on-the-Acorn-CLE-215): a repurposed mining board as a PCIe/SATA/Linux LiteX platform
+
+## Run software on it
+
+- [OSes-Ecosystem](https://github.com/enjoy-digital/litex/wiki/OSes-Ecosystem): what runs on a LiteX SoC: BIOS and bare metal, Zephyr/FreeRTOS/NuttX, MicroPython/Rust/MQuickJS, Linux (VexRiscv-SMP, NaxRiscv, VexiiRiscv, Rocket, hard CPUs), upstream drivers, simulation
+- [BIOS](https://github.com/enjoy-digital/litex/wiki/BIOS): the LiteX BIOS: a capture of the DRAM initialization, the start-up sequence, console commands, boot methods and order (serial, flash, rom, sdcard, sata, net), boot.json, configuration constants and Builder options, where the code is
+- [Run-MicroPython-On-Your-SoC](https://github.com/enjoy-digital/litex/wiki/Run-MicroPython-On-Your-SoC): the litex-hub MicroPython port: build the SoC, build MicroPython against it, load it; FuPy and CircuitPython are historical
+- [Run-Zephyr-On-Your-SoC](https://github.com/enjoy-digital/litex/wiki/Run-Zephyr-On-Your-SoC): Zephyr upstream boards litex_vexriscv/litex_vexiiriscv: build the SoC, generate the DTS overlay and config with litex_json2dts_zephyr, west build, load
+- [Run-Linux-On-Your-SoC](https://github.com/enjoy-digital/litex/wiki/Run-Linux-On-Your-SoC): Linux in three steps with Linux-on-LiteX-VexRiscv (build the SoC, get the images, boot) with a real boot log, the other CPUs (NaxRiscv, VexiiRiscv, Rocket, CVA6, OpenRISC, Microwatt, hard CPUs), the device tree generator and upstream drivers, OpenSBI, simulation, larger systems
+
+## How LiteX works
+
+- [LiteX-Approach](https://github.com/enjoy-digital/litex/wiki/LiteX-Approach): how LiteX is built and used: Python + Migen, cores with stable stream/bus/CSR contracts, portable layering, simulation first, bridges and LiteScope on hardware, practical rules, releases
+- [SoC-builder](https://github.com/enjoy-digital/litex/wiki/SoC-builder): the SoC builder: the target reduced to twelve lines, the classes, the address map, the bus and its handler, CSRs and interrupts, the helpers, the Builder steps
+- [Choosing-A-CPU](https://github.com/enjoy-digital/litex/wiki/Choosing-A-CPU): which CPU to pick (bare metal, Linux, FPU, GDB, CFU), the variants, how a CPU is integrated in the SoC
+- [Wishbone-Bus](https://github.com/enjoy-digital/litex/wiki/Wishbone-Bus): the Wishbone interface (signals, word/byte addressing, bursts, a timing diagram of a write and a read), the interconnect blocks (shared, crossbar, converters, timeout, cache, CDC, bridges), how a core joins the main bus
+- [AXI-Bus](https://github.com/enjoy-digital/litex/wiki/AXI-Bus): AXI4, AXI4-Lite and AXI4-Stream in LiteX: interfaces, interconnects, converters, bridges to Wishbone/CSR, where AXI appears (vendor IP, hard CPUs, big soft CPUs, LiteDRAM, standalone cores)
+- [CSR-Bus](https://github.com/enjoy-digital/litex/wiki/CSR-Bus): the CSR bus (adr, re, we, dat_w, dat_r; one-cycle writes, two-cycle reads, a timing diagram), declaring CSRStorage/CSRStatus with fields, addresses and csr.csv, csr.h from software, simulation, options
+- [Streams](https://github.com/enjoy-digital/litex/wiki/Streams): LiteX streams (valid/ready/first/last/payload/param, a timing diagram of a packet with a stall), the generic blocks (FIFOs, CDC, converters, pipelines, monitors), packets, AXI-Stream/Avalon-ST mapping
+- [LiteX-for-Hardware-Engineers](https://github.com/enjoy-digital/litex/wiki/LiteX-for-Hardware-Engineers): the Verilog-to-LiteX cheat sheet: modules, always blocks, FSMs, instantiation, constraints, clocks, CDC, streams, CSRs, interrupts, buses, memories, testbenches, ILA, build flow
+- [LiteX-for-Hardware-Engineers-2018](https://github.com/enjoy-digital/litex/wiki/LiteX-for-Hardware-Engineers-2018): bunnie's 2018 introduction to LiteX for engineers coming from Verilog and Vivado, kept with dated notes (archive)
+
+## Reference
+
+- [CPUs](https://github.com/enjoy-digital/litex/wiki/CPUs): the catalog of the soft CPUs by family (Linux-capable, MCU-class, tiny, other ISAs) with ISA, variants, options and sources, the emulator, CI, the compilers
+- [Hard-core-CPUs](https://github.com/enjoy-digital/litex/wiki/Hard-core-CPUs): hard CPUs: Zynq-7000, ZynqMP, Cyclone V HPS, Agilex HPS, EOS S3, Gowin EMCU/AE350
+- [SoC-Builder-Reference](https://github.com/enjoy-digital/litex/wiki/SoC-Builder-Reference): reference tables: the SoCCore arguments and their --options, the add_* helpers, the Builder options, the finalization checks
+- [Cores](https://github.com/enjoy-digital/litex/wiki/Cores): the in-tree cores of litex/soc/cores by theme (control, communication, memory, video, audio, clocking), their interfaces and SoC helpers, the EventManager IRQ model, litex.gen helpers
+- [Cores-Ecosystem](https://github.com/enjoy-digital/litex/wiki/Cores-Ecosystem): the Lite* cores (LiteDRAM, LiteEth, LitePCIe, LiteNVMe, LiteSATA, LiteSDCard, LiteICLink, LiteJESD204, LiteSPI, LiteI2C, LiteScope, LiteDSP): standards, supported hardware, standalone generators
+- [Build-Backends](https://github.com/enjoy-digital/litex/wiki/Build-Backends): platforms and toolchains per vendor (Xilinx, Intel, Lattice, Gowin, Efinix, CologneChip, Microsemi, QuickLogic, Anlogic), how tools are found, options, generic I/O specials, mixed-language converters, build bundles, programmers
+- [Tools](https://github.com/enjoy-digital/litex/wiki/Tools): every LiteX command-line tool (litex_term, litex_server, litex_cli, litex_mcp, litex_jtag, litex_sim, litex_soc_gen, litex_periph_gen, litex_bare_metal_demo, build bundles, litex_read_verilog, the *_gen generators, the DTS/Renode exporters, litex_setup/release)
+- [SoC-Documentation](https://github.com/enjoy-digital/litex/wiki/SoC-Documentation): generating the register-level Sphinx documentation and the SVD (--doc, generate_docs/generate_svd), documenting registers with CSRField and modules with ModuleDoc
+
+## Projects and community
+
+- [Projects](https://github.com/enjoy-digital/litex/wiki/Projects): projects built with LiteX in four groups: industrial projects (what funds LiteX, custom developments and support, LiteX-WR-NIC, PCIe SDR and SDI boards), Enjoy-Digital (framework, cores, TriXium, LiteX-M2SDR, USB3-PIPE, Acorn baseboard, ChromatiX, CamLink 4K...), LiteX-Hub collaborative projects, community projects, projects built with AI agents (mmRISC-2, openTPU) and what LiteX offers them
+- [Tutorials-Resources](https://github.com/enjoy-digital/litex/wiki/Tutorials-Resources): tutorials and workshops (FPGA 101, fjullien, Fomu, iCEBreaker), examples to read, articles and blog posts (LiteX Notes), talks and papers
+- [Feedback-Contribution-Support](https://github.com/enjoy-digital/litex/wiki/Feedback-Contribution-Support): how to report an issue (what to include), contribute a pull request, get support
+- [Contributing-to-the-Wiki](https://github.com/enjoy-digital/litex/wiki/Contributing-to-the-Wiki): the wiki is generated from doc/wiki in the repository: how to edit a page, the page shape and the voice, pictures, diagrams and captures, the local preview, the checks (--strict in CI)
+
+## For AI agents
+
+- [LiteX-for-AI-Agents](https://github.com/enjoy-digital/litex/wiki/LiteX-for-AI-Agents): a map of LiteX for an agent working in or with it: what LiteX is, the repository layout, the key classes, the commands that answer questions fast, the conventions, how to verify a change, pitfalls, using LiteX from a project, driving a SoC through MCP (litex_mcp), the agent skills (doc/agent/skills, Claude Code plugin), why and how to contribute the fixes back
+
+### Ecosystem
+
+The AGENTS.md (where things are, how to verify a change, the rules) and the README of each
+repository of the ecosystem, as raw markdown on its default branch:
+
+- [LiteX AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litex/master/AGENTS.md): the framework: SoC builder, interconnect, in-tree cores, CPUs, build backends, BIOS, host tools, litex_mcp; README: https://raw.githubusercontent.com/enjoy-digital/litex/master/README.md
+- [LiteX-Boards AGENTS.md](https://raw.githubusercontent.com/litex-hub/litex-boards/master/AGENTS.md): platforms and targets of the supported boards; README: https://raw.githubusercontent.com/litex-hub/litex-boards/master/README.md
+- [LiteDRAM AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litedram/master/AGENTS.md): DRAM controller, PHYs (SDR to DDR4, LPDDR4/5), frontends, standalone generator; README: https://raw.githubusercontent.com/enjoy-digital/litedram/master/README.md
+- [LiteEth AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/liteeth/master/AGENTS.md): Ethernet MAC, PHYs, UDP/IP stack, Etherbone; README: https://raw.githubusercontent.com/enjoy-digital/liteeth/master/README.md
+- [LitePCIe AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litepcie/master/AGENTS.md): PCIe endpoint and root-port cores, DMA, Linux driver; README: https://raw.githubusercontent.com/enjoy-digital/litepcie/master/README.md
+- [LiteSATA AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litesata/master/AGENTS.md): SATA PHY and core; README: https://raw.githubusercontent.com/enjoy-digital/litesata/master/README.md
+- [LiteSDCard AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litesdcard/master/AGENTS.md): SD card controller; README: https://raw.githubusercontent.com/enjoy-digital/litesdcard/master/README.md
+- [LiteICLink AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/liteiclink/master/AGENTS.md): inter-chip links: SerWB and transceiver wrappers; README: https://raw.githubusercontent.com/enjoy-digital/liteiclink/master/README.md
+- [LiteJESD204 AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litejesd204/master/AGENTS.md): JESD204B/C cores; README: https://raw.githubusercontent.com/enjoy-digital/litejesd204/master/README.md
+- [LiteSPI AGENTS.md](https://raw.githubusercontent.com/litex-hub/litespi/master/AGENTS.md): SPI and SPI flash cores; README: https://raw.githubusercontent.com/litex-hub/litespi/master/README.md
+- [LiteI2C AGENTS.md](https://raw.githubusercontent.com/litex-hub/litei2c/main/AGENTS.md): I2C core; README: https://raw.githubusercontent.com/litex-hub/litei2c/main/README.md
+- [LiteScope AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litescope/master/AGENTS.md): embedded logic analyzer, litescope_cli; README: https://raw.githubusercontent.com/enjoy-digital/litescope/master/README.md
+- [USB3-PIPE AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/usb3_pipe/master/AGENTS.md): USB3 PHY on FPGA transceivers and a USB3 device core; README: https://raw.githubusercontent.com/enjoy-digital/usb3_pipe/master/README.md
+- [LiteNVMe AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litenvme/main/AGENTS.md): NVMe host core on a LitePCIe root port; README: https://raw.githubusercontent.com/enjoy-digital/litenvme/main/README.md
+- [LiteDSP AGENTS.md](https://raw.githubusercontent.com/enjoy-digital/litedsp/main/AGENTS.md): RF/DSP blocks (work in progress); README: https://raw.githubusercontent.com/enjoy-digital/litedsp/main/README.md
+
+## Moved pages (kept for their links)
+
+- [Create-A-complex-SoC-With-Cores-From-The-Ecosystem](https://github.com/enjoy-digital/litex/wiki/Create-A-complex-SoC-With-Cores-From-The-Ecosystem): moved to Create-A-Complex-SoC
+- [Create-And-Load-Software-To-The-CPU](https://github.com/enjoy-digital/litex/wiki/Create-And-Load-Software-To-The-CPU): moved to Write-Firmware-For-Your-SoC
+- [Document-a-SoC](https://github.com/enjoy-digital/litex/wiki/Document-a-SoC): moved to SoC-Documentation
+- [Export-Your-Core-SoC-To-Verilog](https://github.com/enjoy-digital/litex/wiki/Export-Your-Core-SoC-To-Verilog): moved to Export-To-Verilog
+- [FPGA-and-SPI-Flash-programmers](https://github.com/enjoy-digital/litex/wiki/FPGA-and-SPI-Flash-programmers): moved to Load-And-Flash
+- [Firmware](https://github.com/enjoy-digital/litex/wiki/Firmware): moved to OSes-Ecosystem
+- [Generate-Renode-simulation](https://github.com/enjoy-digital/litex/wiki/Generate-Renode-simulation): moved to SoC-Simulator
+- [JTAG-GDB-Debugging-with-VexRiscv-CPU](https://github.com/enjoy-digital/litex/wiki/JTAG-GDB-Debugging-with-VexRiscv-CPU): moved to Debug-With-GDB
+- [JTAG-GDB-Debugging-with-VexRiscv-SMP-NaxRiscv-VexiiRiscv-CPUs](https://github.com/enjoy-digital/litex/wiki/JTAG-GDB-Debugging-with-VexRiscv-SMP-NaxRiscv-VexiiRiscv-CPUs): moved to Debug-With-GDB
+- [Load-Application-Code-To-CPU](https://github.com/enjoy-digital/litex/wiki/Load-Application-Code-To-CPU): moved to Write-Firmware-For-Your-SoC
+- [OS-support](https://github.com/enjoy-digital/litex/wiki/OS-support): moved to OSes-Ecosystem
+- [Related-Projects](https://github.com/enjoy-digital/litex/wiki/Related-Projects): moved to Projects
+- [Reuse-a-(System)Verilog,-VHDL,-Amaranth,-Spinal-HDL,-Chisel-core](https://github.com/enjoy-digital/litex/wiki/Reuse-a-(System)Verilog,-VHDL,-Amaranth,-Spinal-HDL,-Chisel-core): moved to Reuse-An-Existing-Core
+- [Reuse-a-SystemVerilog-VHDL-Amaranth-Spinal-HDL-Chisel-core](https://github.com/enjoy-digital/litex/wiki/Reuse-a-SystemVerilog-VHDL-Amaranth-Spinal-HDL-Chisel-core): moved to Reuse-An-Existing-Core
+- [Run-MicroPython-CircuitPython-On-Your-SoC](https://github.com/enjoy-digital/litex/wiki/Run-MicroPython-CircuitPython-On-Your-SoC): moved to Run-MicroPython-On-Your-SoC
+- [Soft-CPU](https://github.com/enjoy-digital/litex/wiki/Soft-CPU): moved to CPUs
+- [Use-Host-Bridge-to-control-debug-a-SoC](https://github.com/enjoy-digital/litex/wiki/Use-Host-Bridge-to-control-debug-a-SoC): moved to Host-Bridges

@@ -9,7 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <console.h>
+#include <libbase/console.h>
 
 #define R(mul,shift,x,y) \
   _=x; \
@@ -21,6 +21,7 @@
 
 signed char b[1760], z[1760];
 
+void donut(void);
 void donut(void) {
   int sA=1024,cA=0,sB=1024,cB=0,_;
   for (;;) {
@@ -59,9 +60,9 @@ void donut(void) {
     R(5, 7, cA, sA);
     R(5, 8, cB, sB);
   	if (readchar_nonblock()) {
-  		readchar();
+  		getchar();
   		break;
   	}
-    putsnonl("\x1b[23A");
+    fputs("\x1b[23A", stdout);
   }
 }

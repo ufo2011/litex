@@ -11,42 +11,46 @@ import os
 
 from migen import *
 
+from litex.gen import *
+
 from litex import get_data_mod
 from litex.soc.interconnect import wishbone
 from litex.soc.cores.cpu import CPU
 
-CPU_VARIANTS = ["standard", "standard+fpu", "linux", "linux+fpu",
-                "linux+smp", "linux+smp+fpu"]
+# Variants -----------------------------------------------------------------------------------------
 
+CPU_VARIANTS = ["standard", "standard+fpu", "linux", "linux+fpu", "linux+smp", "linux+smp+fpu"]
+
+# Mor1kx -------------------------------------------------------------------------------------------
 
 class MOR1KX(CPU):
+    category             = "softcore"
+    family               = "or1k"
     name                 = "mor1kx"
     human_name           = "MOR1KX"
     variants             = CPU_VARIANTS
     data_width           = 32
     endianness           = "big"
-    gcc_triple           = "or1k-elf"
+    gcc_triple           = ("or1k-elf", "or1k-linux")
     clang_triple         = "or1k-linux"
     linker_output_format = "elf32-or1k"
     nop                  = "l.nop"
-    io_regions           = {0x80000000: 0x80000000} # origin, length
+    io_regions           = {0x8000_0000: 0x8000_0000} # Origin, Length.
 
+    # Memory Mapping for Linux variant.
     @property
     def mem_map_linux(self):
         # Mainline Linux OpenRISC arch code requires Linux kernel to be loaded at the physical
         # address of 0x0. As we are running Linux from the MAIN_RAM region - move it to satisfy
         # that requirement.
         return {
-            "main_ram" : 0x00000000,
-            "rom"      : 0x10000000,
-            "sram"     : 0x50000000,
-            "csr"      : 0xe0000000,
+            "main_ram" : 0x0000_0000,
+            "rom"      : 0x1000_0000,
+            "sram"     : 0x5000_0000,
+            "csr"      : 0xe000_0000,
         }
 
-    @property
-    def gcc_triple(self):
-        return "or1k-elf"
-
+    # GCC Flags.
     @property
     def gcc_flags(self):
         flags =  "-mhard-mul "
@@ -60,6 +64,7 @@ class MOR1KX(CPU):
 
         return flags
 
+    # Clang Flags.
     @property
     def clang_flags(self):
         flags =  "-mhard-mul "
@@ -69,6 +74,7 @@ class MOR1KX(CPU):
         flags += "-D__mor1kx__ "
         return flags
 
+    # Reserved Interrupts.
     @property
     def reserved_interrupts(self):
         return {"nmi": 0}
@@ -78,17 +84,14 @@ class MOR1KX(CPU):
         self.variant      = variant
         self.reset        = Signal()
         self.interrupt    = Signal(32)
-        self.ibus         = i = wishbone.Interface()
-        self.dbus         = d = wishbone.Interface()
-        self.periph_buses = [i, d]
-        self.memory_buses = []
-
-
-        if "linux" in variant:
-            self.mem_map = self.mem_map_linux
+        self.ibus         = ibus = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
+        self.dbus         = dbus = wishbone.Interface(data_width=32, address_width=32, addressing="byte")
+        self.periph_buses = [ibus, dbus] # Peripheral buses (Connected to main SoC's bus).
+        self.memory_buses = []           # Memory buses (Connected directly to LiteDRAM).
 
         # # #
 
+        # CPU parameters.
         cpu_args = dict(
             p_FEATURE_INSTRUCTIONCACHE  = "ENABLED",
             p_OPTION_ICACHE_BLOCK_WIDTH = 4,
@@ -100,30 +103,29 @@ class MOR1KX(CPU):
             p_OPTION_DCACHE_SET_WIDTH   = 8,
             p_OPTION_DCACHE_WAYS        = 1,
             p_OPTION_DCACHE_LIMIT_WIDTH = 31,
-            p_FEATURE_TIMER             = "NONE",
-            p_OPTION_PIC_TRIGGER        = "LEVEL",
-            p_FEATURE_SYSCALL           = "NONE",
-            p_FEATURE_TRAP              = "NONE",
-            p_FEATURE_RANGE             = "NONE",
-            p_FEATURE_OVERFLOW          = "NONE",
-            p_FEATURE_ADDC              = "ENABLED",
-            p_FEATURE_CMOV              = "ENABLED",
-            p_FEATURE_FFL1              = "ENABLED",
-            p_OPTION_CPU0               = "CAPPUCCINO",
-            p_IBUS_WB_TYPE              = "B3_REGISTERED_FEEDBACK",
-            p_DBUS_WB_TYPE              = "B3_REGISTERED_FEEDBACK",
+            p_FEATURE_TIMER      = "NONE",
+            p_OPTION_PIC_TRIGGER = "LEVEL",
+            p_FEATURE_SYSCALL    = "NONE",
+            p_FEATURE_TRAP       = "NONE",
+            p_FEATURE_RANGE      = "NONE",
+            p_FEATURE_OVERFLOW   = "NONE",
+            p_FEATURE_ADDC       = "ENABLED",
+            p_FEATURE_CMOV       = "ENABLED",
+            p_FEATURE_FFL1       = "ENABLED",
+            p_OPTION_CPU0        = "CAPPUCCINO",
+            p_IBUS_WB_TYPE       = "B3_REGISTERED_FEEDBACK",
+            p_DBUS_WB_TYPE       = "B3_REGISTERED_FEEDBACK",
         )
 
+        # SMP parameters.
         if "smp" in variant:
-           cpu_args.update(
-               p_OPTION_RF_NUM_SHADOW_GPR = 1,
-           )
+           cpu_args.update(p_OPTION_RF_NUM_SHADOW_GPR=1)
 
+        # FPU parameters.
         if "fpu" in variant:
-            cpu_args.update(
-                p_FEATURE_FPU = "ENABLED",
-            )
+            cpu_args.update(p_FEATURE_FPU = "ENABLED")
 
+        # Linux parameters
         if "linux" in variant:
             cpu_args.update(
                 # Linux needs the memory management units.
@@ -135,6 +137,8 @@ class MOR1KX(CPU):
                 p_FEATURE_ROR = "ENABLED",
                 p_FEATURE_EXT = "ENABLED",
             )
+            # Linux variant requires specific Memory Mapping.
+            self.mem_map = self.mem_map_linux
             # FIXME: Check if these are needed?
             use_defaults = (
                 "p_FEATURE_SYSCALL",
@@ -145,53 +149,49 @@ class MOR1KX(CPU):
             for to_remove in use_defaults:
                 del cpu_args[to_remove]
 
-        i_adr_o = Signal(32)
-        d_adr_o = Signal(32)
         self.cpu_params = dict(
             **cpu_args,
 
-            i_clk=ClockSignal(),
-            i_rst=ResetSignal() | self.reset,
+            # Clk / Rst.
+            i_clk = ClockSignal("sys"),
+            i_rst = ResetSignal("sys") | self.reset,
 
+            # IRQ.
             i_irq_i=self.interrupt,
 
-            o_iwbm_adr_o = i_adr_o,
-            o_iwbm_dat_o = i.dat_w,
-            o_iwbm_sel_o = i.sel,
-            o_iwbm_cyc_o = i.cyc,
-            o_iwbm_stb_o = i.stb,
-            o_iwbm_we_o  = i.we,
-            o_iwbm_cti_o = i.cti,
-            o_iwbm_bte_o = i.bte,
-            i_iwbm_dat_i = i.dat_r,
-            i_iwbm_ack_i = i.ack,
-            i_iwbm_err_i = i.err,
+            # IBus.
+            o_iwbm_adr_o = ibus.adr,
+            o_iwbm_dat_o = ibus.dat_w,
+            o_iwbm_sel_o = ibus.sel,
+            o_iwbm_cyc_o = ibus.cyc,
+            o_iwbm_stb_o = ibus.stb,
+            o_iwbm_we_o  = ibus.we,
+            o_iwbm_cti_o = ibus.cti,
+            o_iwbm_bte_o = ibus.bte,
+            i_iwbm_dat_i = ibus.dat_r,
+            i_iwbm_ack_i = ibus.ack,
+            i_iwbm_err_i = ibus.err,
             i_iwbm_rty_i = 0,
 
-            o_dwbm_adr_o = d_adr_o,
-            o_dwbm_dat_o = d.dat_w,
-            o_dwbm_sel_o = d.sel,
-            o_dwbm_cyc_o = d.cyc,
-            o_dwbm_stb_o = d.stb,
-            o_dwbm_we_o  = d.we,
-            o_dwbm_cti_o = d.cti,
-            o_dwbm_bte_o = d.bte,
-            i_dwbm_dat_i = d.dat_r,
-            i_dwbm_ack_i = d.ack,
-            i_dwbm_err_i = d.err,
+            # DBus.
+            o_dwbm_adr_o = dbus.adr,
+            o_dwbm_dat_o = dbus.dat_w,
+            o_dwbm_sel_o = dbus.sel,
+            o_dwbm_cyc_o = dbus.cyc,
+            o_dwbm_stb_o = dbus.stb,
+            o_dwbm_we_o  = dbus.we,
+            o_dwbm_cti_o = dbus.cti,
+            o_dwbm_bte_o = dbus.bte,
+            i_dwbm_dat_i = dbus.dat_r,
+            i_dwbm_ack_i = dbus.ack,
+            i_dwbm_err_i = dbus.err,
             i_dwbm_rty_i = 0,
         )
 
-        self.comb += [
-            self.ibus.adr.eq(i_adr_o[2:]),
-            self.dbus.adr.eq(d_adr_o[2:])
-        ]
-
-        # add verilog sources
+        # Add Verilog sources.
         self.add_sources(platform)
 
     def set_reset_address(self, reset_address):
-        assert not hasattr(self, "reset_address")
         self.reset_address = reset_address
         self.cpu_params.update(p_OPTION_RESET_PC=reset_address)
 

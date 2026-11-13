@@ -2,11 +2,19 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdint.h>
+#include <libbase/parse.h>
 
 #include <generated/csr.h>
 
 #include "../command.h"
 #include "../helpers.h"
+
+#include <libbase/progress.h>
+#include <liblitespi/spiflash.h>
+#include <liblitesdcard/spisdcard.h>
+#include <liblitesdcard/sdcard.h>
+#include <libfatfs/ff.h>
 
 /**
  * Command "flash_write"
@@ -14,62 +22,130 @@
  * Write data from a memory buffer to SPI flash
  *
  */
-#if (defined CSR_SPIFLASH_BASE && defined SPIFLASH_PAGE_SIZE)
+#if (defined CSR_SPIFLASH_MASTER_CS_ADDR)
 static void flash_write_handler(int nb_params, char **params)
 {
-	char *c;
 	unsigned int addr;
-	unsigned int value;
+	unsigned long mem_addr;
 	unsigned int count;
-	unsigned int i;
 
-	if (nb_params < 2) {
-		printf("flash_write <offset> <value> [count]");
+
+	if (!parse_uint(params[0], &addr)) {
+		printf("Error: invalid offset\n");
 		return;
 	}
 
-	addr = strtoul(params[0], &c, 0);
-	if (*c != 0) {
-		printf("Incorrect offset");
-		return;
-	}
-
-	value = strtoul(params[1], &c, 0);
-	if (*c != 0) {
-		printf("Incorrect value");
+	if (!parse_ulong(params[1], &mem_addr)) {
+		printf("Error: invalid mem_addr\n");
 		return;
 	}
 
 	if (nb_params == 2) {
 		count = 1;
 	} else {
-		count = strtoul(params[2], &c, 0);
-		if (*c != 0) {
-			printf("Incorrect count");
+		if (!parse_uint(params[2], &count)) {
+			printf("Error: invalid count\n");
 			return;
 		}
 	}
 
-	for (i = 0; i < count; i++)
-		write_to_flash(addr + i * 4, (unsigned char *)&value, 4);
+	if (spiflash_write_stream(addr, (unsigned char *)mem_addr, count) != (int)count)
+		printf("Error: flash write failed (is the region erased? see flash_erase_range)\n");
 }
 
-define_command(flash_write, flash_write_handler, "Write to flash", SPIFLASH_CMDS);
-#endif
+define_command_args(flash_write, flash_write_handler, "Write to flash",
+	"flash_write <offset> <mem_addr> [count]", 2, 3, SPIFLASH_CMDS);
 
-/**
- * Command "flash_erase"
- *
- * Flash erase
- *
- */
-#if (defined CSR_SPIFLASH_BASE && defined SPIFLASH_PAGE_SIZE)
-static void flash_erase_handler(int nb_params, char **params)
+#if defined(CSR_SPISDCARD_BASE) || defined(CSR_SDCARD_BASE)
+static void flash_from_sdcard_handler(int nb_params, char **params)
 {
-	erase_flash();
-	printf("Flash erased\n");
-}
+	FRESULT fr;
+	FATFS fs;
+	FIL file;
+	uint32_t br;
+	uint32_t offset;
+	unsigned long length;
+	uint8_t buf[512];
 
-define_command(flash_erase, flash_erase_handler, "Erase whole flash", SPIFLASH_CMDS);
+
+	char* filename = params[0];
+
+	/* Select the SDCard FatFs disk operations (as sdcardboot): FfDiskOps is NULL at reset and
+	   may point to another medium (sataboot). */
+#ifdef CSR_SPISDCARD_BASE
+	fatfs_set_ops_spisdcard();
+#endif
+#ifdef CSR_SDCARD_BASE
+	fatfs_set_ops_sdcard();
 #endif
 
+	fr = f_mount(&fs, "", 1);
+	if (fr != FR_OK) {
+		printf("Error: filesystem mount failed (FatFs error %d)\n", fr);
+		return;
+	}
+	fr = f_open(&file, filename, FA_READ);
+	if (fr != FR_OK) {
+		printf("%s file not found.\n", filename);
+		f_mount(0, "", 0);
+		return;
+	}
+
+	length = f_size(&file);
+	printf("Copying %s to SPI flash (%ld bytes)...\n", filename, length);
+	init_progression_bar(length);
+	offset = 0;
+	for (;;) {
+		fr = f_read(&file, (void*) buf, 512, (UINT *)&br);
+		if (fr != FR_OK) {
+			printf("Error: file read failed\n");
+			f_close(&file);
+			f_mount(0, "", 0);
+			return;
+		}
+		if (br == 0) {
+			break;
+		} else {
+			if (spiflash_write_stream(offset, buf, br) != (int)br) {
+				printf("Error: flash write failed (is the region erased? see flash_erase_range)\n");
+				f_close(&file);
+				f_mount(0, "", 0);
+				return;
+			}
+		}
+
+		offset += br;
+		show_progress(offset);
+	}
+	show_progress(offset);
+	printf("\n");
+
+	f_close(&file);
+	f_mount(0, "", 0);
+}
+define_command_args(flash_from_sdcard, flash_from_sdcard_handler, "Write file from SD card to flash",
+	"flash_from_sdcard <filename>", 1, 1, SPIFLASH_CMDS);
+#endif
+
+static void flash_erase_range_handler(int nb_params, char **params)
+{
+	unsigned int addr;
+	unsigned int count;
+
+
+	if (!parse_uint(params[0], &addr)) {
+		printf("Error: invalid offset\n");
+		return;
+	}
+
+	if (!parse_uint(params[1], &count)) {
+		printf("Error: invalid count\n");
+		return;
+	}
+
+	spiflash_erase_range(addr, count);
+}
+
+define_command_args(flash_erase_range, flash_erase_range_handler, "Erase flash range",
+	"flash_erase_range <offset> <count>", 2, 2, SPIFLASH_CMDS);
+#endif

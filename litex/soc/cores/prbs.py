@@ -5,15 +5,22 @@
 # Copyright (c) 2015 Sebastien Bourdeauducq <sb@m-labs.hk>
 # SPDX-License-Identifier: BSD-2-Clause
 
-from operator import xor, add
-from functools import reduce
-
 from migen import *
 from migen.genlib.cdc import MultiReg
 
+from litex.gen import *
+from litex.gen.genlib.misc import WaitTimer
+
+# Constants ----------------------------------------------------------------------------------------
+
+PRBS_CONFIG_OFF    = 0b00
+PRBS_CONFIG_PRBS7  = 0b01
+PRBS_CONFIG_PRBS15 = 0b10
+PRBS_CONFIG_PRBS31 = 0b11
+
 # PRBS Generators ----------------------------------------------------------------------------------
 
-class PRBSGenerator(Module):
+class PRBSGenerator(LiteXModule):
     def __init__(self, n_out, n_state=23, taps=[17, 22]):
         self.o = Signal(n_out)
 
@@ -23,7 +30,7 @@ class PRBSGenerator(Module):
         curval = [state[i] for i in range(n_state)]
         curval += [0]*(n_out - n_state)
         for i in range(n_out):
-            nv = reduce(xor, [curval[tap] for tap in taps])
+            nv = Reduce("XOR", [curval[tap] for tap in taps])
             curval.insert(0, nv)
             curval.pop()
 
@@ -49,7 +56,7 @@ class PRBS31Generator(PRBSGenerator):
 
 # PRBS TX ------------------------------------------------------------------------------------------
 
-class PRBSTX(Module):
+class PRBSTX(LiteXModule):
     def __init__(self, width, reverse=False):
         self.config = Signal(2)
         self.i      = Signal(width)
@@ -59,59 +66,62 @@ class PRBSTX(Module):
 
         config = Signal(2)
 
-        # Generators
+        # Generators.
         self.specials += MultiReg(self.config, config)
         prbs7  = PRBS7Generator(width)
         prbs15 = PRBS15Generator(width)
         prbs31 = PRBS31Generator(width)
         self.submodules += prbs7, prbs15, prbs31
 
-        # PRBS Selection
+        # PRBS Selection.
         prbs_data = Signal(width)
-        self.comb += [
-            If(config == 0b11,
-                prbs_data.eq(prbs31.o)
-            ).Elif(config == 0b10,
-                prbs_data.eq(prbs15.o)
-            ).Else(
-                prbs_data.eq(prbs7.o)
-            )
-        ]
+        self.comb += Case(self.config, {
+            PRBS_CONFIG_OFF    : prbs_data.eq(0),
+            PRBS_CONFIG_PRBS7  : prbs_data.eq(prbs7.o),
+            PRBS_CONFIG_PRBS15 : prbs_data.eq(prbs15.o),
+            PRBS_CONFIG_PRBS31 : prbs_data.eq(prbs31.o),
+        })
 
-        # Optional bits reversing
+        # Optional Bits Reversing.
         if reverse:
             new_prbs_data = Signal(width)
             self.comb += new_prbs_data.eq(prbs_data[::-1])
             prbs_data = new_prbs_data
 
-        # PRBS / Data Selection
+        # PRBS / Data Selection.
         self.comb += [
-            If(config == 0,
-                self.o.eq(self.i)
-            ).Else(
+            self.o.eq(self.i),
+            If(config != 0,
                 self.o.eq(prbs_data)
             )
         ]
 
 # PRBS Checkers ------------------------------------------------------------------------------------
 
-class PRBSChecker(Module):
+class PRBSChecker(LiteXModule):
     def __init__(self, n_in, n_state=23, taps=[17, 22]):
         self.i      = Signal(n_in)
         self.errors = Signal(n_in)
 
         # # #
 
+        # LFSR Update / Check.
         state  = Signal(n_state, reset=1)
         curval = [state[i] for i in range(n_state)]
         for i in reversed(range(n_in)):
-            correctv = reduce(xor, [curval[tap] for tap in taps])
+            correctv = Reduce("XOR", [curval[tap] for tap in taps])
             self.sync += self.errors[i].eq(self.i[i] != correctv)
             curval.insert(0, self.i[i])
             curval.pop()
-
         self.sync += state.eq(Cat(*curval[:n_state]))
 
+        # Idle Check.
+        i_last     = Signal(n_in)
+        idle_timer = WaitTimer(1024)
+        self.submodules += idle_timer
+        self.sync += i_last.eq(self.i)
+        self.comb += idle_timer.wait.eq(self.i == i_last)
+        self.sync += If(idle_timer.done, self.errors.eq(2**n_in-1))
 
 class PRBS7Checker(PRBSChecker):
     def __init__(self, n_out):
@@ -129,47 +139,54 @@ class PRBS31Checker(PRBSChecker):
 
 # PRBS RX ------------------------------------------------------------------------------------------
 
-class PRBSRX(Module):
-    def __init__(self, width, reverse=False):
+class PRBSRX(LiteXModule):
+    def __init__(self, width, reverse=False, errors_width=32, with_errors_saturation=False):
         self.config = Signal(2)
         self.pause  = Signal()
         self.i      = Signal(width)
-        self.errors = Signal(32)
+        self.errors = errors = Signal(errors_width)
 
         # # #
 
         config = Signal(2)
 
-        # Optional bits reversing
+        # Optional bits reversing.
         prbs_data = self.i
         if reverse:
             new_prbs_data = Signal(width)
             self.comb += new_prbs_data.eq(prbs_data[::-1])
             prbs_data = new_prbs_data
 
-        # Checkers
+        # Checkers (config and pause come from the control clock domain: synchronize both).
+        pause = Signal()
         self.specials += MultiReg(self.config, config)
+        self.specials += MultiReg(self.pause,  pause)
         prbs7  = PRBS7Checker(width)
         prbs15 = PRBS15Checker(width)
         prbs31 = PRBS31Checker(width)
         self.submodules += prbs7, prbs15, prbs31
         self.comb += [
-            prbs7.i.eq(prbs_data),
+            prbs7.i.eq( prbs_data),
             prbs15.i.eq(prbs_data),
-            prbs31.i.eq(prbs_data)
+            prbs31.i.eq(prbs_data),
         ]
 
-        # Errors count
+        # Errors count (with optional saturation). The pause takes effect two cycles after the data
+        # it applies to (the error register and the synchronizer), which is fine for a CSR-driven pause.
+        error        = Signal()
+        count_enable = ~pause
+        if with_errors_saturation:
+            count_enable = count_enable & (errors != (2**errors_width-1))
         self.sync += [
-            If(config == 0,
-                self.errors.eq(0)
-            ).Elif(~self.pause & (self.errors != (2**32-1)),
-                If(config == 0b01,
-                    self.errors.eq(self.errors + (prbs7.errors != 0))
-                ).Elif(config == 0b10,
-                    self.errors.eq(self.errors + (prbs15.errors != 0))
-                ).Elif(config == 0b11,
-                    self.errors.eq(self.errors + (prbs31.errors != 0))
-                )
+            Case(config, {
+                PRBS_CONFIG_OFF    : error.eq(0),
+                PRBS_CONFIG_PRBS7  : error.eq(prbs7.errors  != 0),
+                PRBS_CONFIG_PRBS15 : error.eq(prbs15.errors != 0),
+                PRBS_CONFIG_PRBS31 : error.eq(prbs31.errors != 0),
+            }),
+            If(config == PRBS_CONFIG_OFF,
+                errors.eq(0)
+            ).Elif(count_enable,
+                errors.eq(errors + error)
             )
         ]

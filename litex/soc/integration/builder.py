@@ -2,7 +2,7 @@
 # This file is part of LiteX.
 #
 # This file is Copyright (c) 2015 Sebastien Bourdeauducq <sb@m-labs.hk>
-# This file is Copyright (c) 2015-2019 Florent Kermarrec <florent@enjoy-digital.fr>
+# This file is Copyright (c) 2015-2024 Florent Kermarrec <florent@enjoy-digital.fr>
 # This file is Copyright (c) 2018-2019 Antmicro <www.antmicro.com>
 # This file is Copyright (c) 2018 Sergiusz Bazanski <q3k@q3k.org>
 # This file is Copyright (c) 2016-2017 Tim 'mithro' Ansell <mithro@mithis.com>
@@ -13,26 +13,84 @@
 
 
 import os
-import subprocess
-import struct
+import sys
+import json
+import time
 import shutil
+import inspect
+import logging
+import argparse
+import datetime
+import subprocess
+
+from packaging.version import Version
 
 from litex import get_data_mod
-from litex.build.tools import write_to_file
-from litex.soc.integration import export, soc_core
-from litex.soc.cores import cpu
+from litex.gen import colorer
+
+from litex.build.bundle import BuildBundle, get_pythonpath_roots, remap_path
+from litex.build.tools import write_to_file, get_litex_git_revision
+from litex.build.log import build_log_context
+
+from litex.soc.integration import export, soc
 
 # Helpers ------------------------------------------------------------------------------------------
 
 def _makefile_escape(s):
-    return s.replace("\\", "\\\\")
+    return s.replace("\\", "\\\\").replace("$", "$$")
 
-def _create_dir(d):
-    os.makedirs(os.path.realpath(d), exist_ok=True)
+def _check_makefile_path(p):
+    # Make cannot represent spaces in its space-separated path lists (PACKAGE_DIRS etc.) and "#"
+    # starts a comment: fail loudly instead of generating a corrupt variables.mak that breaks the
+    # software build with confusing errors.
+    if any(c in p for c in " \t\n#"):
+        raise ValueError(
+            f"Unsupported character in build path {p!r}: "
+            "Make cannot handle spaces/'#' in paths, use a path without them.")
+    return p
+
+def _get_git_revisions():
+    # Short Git revision of the loaded Migen/LiteX repositories (when installed from a Git clone).
+    revisions = {}
+    for name in sorted({m.split(".")[0] for m in list(sys.modules)}):
+        if not (name == "migen" or name.startswith("lite")):
+            continue
+        module_file = getattr(sys.modules.get(name), "__file__", None)
+        if module_file is None:
+            continue
+        module_dir = os.path.dirname(os.path.abspath(module_file))
+        try:
+            r = subprocess.check_output(["git", "rev-parse", "--show-toplevel", "--short", "HEAD"],
+                cwd=module_dir, stderr=subprocess.DEVNULL, timeout=10).decode("utf-8").split()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        # Only report the repository the package is a direct child of (not an enclosing one).
+        if len(r) == 2 and os.path.realpath(os.path.dirname(module_dir)) == os.path.realpath(r[0]):
+            revisions[name] = r[1]
+    return revisions
+
+def _get_analyzer_csvs(module, depth=0):
+    # analyzer.csv files exported by the LiteScope analyzers of the design (written by their do_exit).
+    csvs = []
+    if type(module).__name__ == "LiteScopeAnalyzer" and getattr(module, "csr_csv", None):
+        csvs.append(os.path.abspath(module.csr_csv))
+    if depth < 16:
+        for _, submodule in getattr(module, "_submodules", []):
+            csvs += _get_analyzer_csvs(submodule, depth + 1)
+    return csvs
+
+def _create_dir(d, remove_if_exists=False):
+    dir_path = os.path.realpath(d)
+    if remove_if_exists and os.path.exists(dir_path):
+        shutil.rmtree(dir_path)
+    os.makedirs(dir_path, exist_ok=True)
 
 # Software Packages --------------------------------------------------------------------------------
 
 soc_software_packages = [
+    # picolibc
+    "libc",
+
     # Compiler-RT.
     "libcompiler_rt",
 
@@ -46,14 +104,11 @@ soc_software_packages = [
     "libliteeth",
     "liblitesdcard",
     "liblitesata",
-
-    # BIOS.
-    "bios"
 ]
 
 # Builder ------------------------------------------------------------------------------------------
 
-soc_directory         = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+soc_directory = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 class Builder:
     def __init__(self, soc,
@@ -64,9 +119,11 @@ class Builder:
         include_dir      = None,
         generated_dir    = None,
 
-        # Compile Options.
+        # Compilation.
         compile_software = True,
         compile_gateware = True,
+        build_backend    = "litex",
+        build_log        = True,
 
         # Exports.
         csr_json         = None,
@@ -74,13 +131,32 @@ class Builder:
         csr_svd          = None,
         memory_x         = None,
 
-        # BIOS Options.
-        bios_options     = [],
+        # BIOS.
+        bios_lto                 = False,
+        bios_format              = "integer",
+        bios_console             = "full",
+        bios_no_ansi             = False,
+        bios_stack_margin        = None,
+        libc_mode                = "minimal",
+        integrated_rom_auto_size = True,
 
         # Documentation.
-        generate_doc     = False):
+        generate_doc     = False,
 
-        self.soc = soc
+        # Verilog.
+        hierarchical     = False,
+
+        # Build Bundle.
+        build_bundle           = False,
+        bundle_root            = None,
+        bundle_include         = None,
+        bundle_pythonpath_root = None,
+        bundle_auto_pythonpath = False,
+        bundle_strict          = "warn"):
+
+        # SoC/Builder Attach.
+        self.soc         = soc   # Attach SoC to Builder.
+        self.soc.builder = self  # Attach Builder to SoC.
 
         # Directories.
         self.output_dir    = os.path.abspath(output_dir    or os.path.join("build", soc.platform.name))
@@ -89,83 +165,199 @@ class Builder:
         self.include_dir   = os.path.abspath(include_dir   or os.path.join(self.software_dir, "include"))
         self.generated_dir = os.path.abspath(generated_dir or os.path.join(self.include_dir,  "generated"))
 
-        # Compile Options.
+        # Compilation.
         self.compile_software = compile_software
         self.compile_gateware = compile_gateware
+        self.build_backend    = build_backend
+        self.build_log        = build_log
 
-        # Exports.
-        self.csr_csv  = csr_csv
-        self.csr_json = csr_json
+        # Exports (Generated by default to output_dir with default name unless explicitly specified).
+        self.csr_csv  = csr_csv  if csr_csv  else os.path.join(self.output_dir, "csr.csv")
+        self.csr_json = csr_json if csr_json else os.path.join(self.output_dir, "csr.json")
         self.csr_svd  = csr_svd
         self.memory_x = memory_x
 
-        # BIOS Options.
-        self.bios_options = bios_options
+        # BIOS.
+        self.bios_lto                 = bios_lto
+        self.bios_format              = bios_format
+        self.bios_console             = bios_console
+        self.bios_no_ansi             = bios_no_ansi
+        self.bios_stack_margin        = bios_stack_margin
+        self.libc_mode                = libc_mode
+        self.integrated_rom_auto_size = integrated_rom_auto_size
 
-        # Documentation
+        # Documentation.
         self.generate_doc = generate_doc
 
-        # List software packages.
-        self.software_packages = []
+        # Verilog.
+        self.hierarchical = hierarchical
+
+        # Build Bundle.
+        self.build_bundle           = bool(build_bundle) and (os.getenv("LITEX_BUILD_BUNDLE_REPLAY", "0") != "1")
+        self.build_bundle_path      = build_bundle if isinstance(build_bundle, str) else None
+        self.bundle_root            = [] if bundle_root            is None else list(bundle_root)
+        self.bundle_include         = [] if bundle_include         is None else list(bundle_include)
+        self.bundle_pythonpath_root = [] if bundle_pythonpath_root is None else list(bundle_pythonpath_root)
+        self.bundle_auto_pythonpath = bundle_auto_pythonpath
+        self.bundle_strict          = bundle_strict
+        self.last_build_bundle      = None
+
+        # Software packages and libraries.
+        self.software_packages  = []
+        self.software_libraries = []
+        self.software_always_link_libraries = []
         for name in soc_software_packages:
             self.add_software_package(name)
+            self.add_software_library(name)
+
+        # JSONs.
+        self.jsons         = []
+        self._jsons_merged = False
 
     def add_software_package(self, name, src_dir=None):
         if src_dir is None:
             src_dir = os.path.join(soc_directory, "software", name)
+        src_dir = remap_path(src_dir)
         self.software_packages.append((name, src_dir))
 
-    def _generate_includes(self):
+    def _has_software_package(self, name):
+        return any(package_name == name for package_name, _ in self.software_packages)
+
+    def add_software_library(self, name, always_link=False):
+        self.software_libraries.append(name)
+        if always_link:
+            self.software_always_link_libraries.append(name)
+
+    def add_json(self, filename, origin=0, name="", exclude_constants=None):
+        if exclude_constants is None:
+            exclude_constants = ["_INTERRUPT"]
+        filename = remap_path(filename)
+        self.jsons.append((filename, origin, name, exclude_constants))
+
+    def _load_jsons(self):
+        # Parse each JSON file only once for the mem_regions/constants/csr_regions getters.
+        if not hasattr(self, "_jsons_cache"):
+            self._jsons_cache = [
+                (export.load_csr_json(filename, origin, name), exclude)
+                for filename, origin, name, exclude in self.jsons]
+        return self._jsons_cache
+
+    def _get_json_mem_regions(self):
+        mem_regions = {}
+        for (_, _, _mem_regions), _ in self._load_jsons():
+            mem_regions.update(_mem_regions)
+        return mem_regions
+
+    def _get_json_constants(self):
+        constants = {}
+        for (_, _constants, _), exclude in self._load_jsons():
+            _constants = {k: v for k, v in _constants.items() if not any(ex in k for ex in exclude)}
+            constants.update(_constants)
+        return constants
+
+    def _get_json_csr_regions(self):
+        csr_regions = {}
+        for (_csr_regions, _, _), _ in self._load_jsons():
+            csr_regions.update(_csr_regions)
+        return csr_regions
+
+    def _merge_json_items(self, items, new_items, kind):
+        collisions = sorted(set(items).intersection(new_items))
+        if collisions:
+            raise ValueError(
+                "JSON {} collision on {}. Use Builder.add_json(..., name=...) to namespace imports.".format(
+                    kind, ", ".join(collisions)))
+        items.update(new_items)
+
+    def _get_variables_contents(self):
+        # Helper.
+        variables_contents = []
+        def define(k, v):
+            k = k.replace("-", "_")
+            try:
+                variables_contents.append("{}={}".format(k, _makefile_escape(v)))
+            except AttributeError:
+                print(colorer(f"problem with {k}:", "red"))
+                raise
+
+        # Define packages and libraries.
+        define("PACKAGES",     " ".join(name    for name, src_dir in self.software_packages))
+        define("PACKAGE_DIRS", " ".join(_check_makefile_path(src_dir) for name, src_dir in self.software_packages))
+        define("LIBS",         " ".join(self.software_libraries))
+        define("ALWAYS_LINK_LIBS", " ".join(self.software_always_link_libraries))
+
+        # Define CPU variables.
+        for k, v in export.get_cpu_mak(self.soc.cpu, self.compile_software):
+            define(k, v)
+
+        # Define SoC/Picolibc/Compiler-RT/Software/Include directories.
+        picolibc_directory    = remap_path(get_data_mod("software", "picolibc").data_location)
+        compiler_rt_directory = remap_path(get_data_mod("software", "compiler_rt").data_location)
+
+        define("SOC_DIRECTORY",         _check_makefile_path(remap_path(soc_directory)))
+        define("PICOLIBC_DIRECTORY",    _check_makefile_path(picolibc_directory))
+        define("PICOLIBC_FORMAT",       self.bios_format)
+        define("LIBC_MODE",             self.libc_mode)
+        define("COMPILER_RT_DIRECTORY", _check_makefile_path(compiler_rt_directory))
+        variables_contents.append("export BUILDINC_DIRECTORY")
+        define("BUILDINC_DIRECTORY", _check_makefile_path(self.include_dir))
+        for name, src_dir in self.software_packages:
+            define(name.upper() + "_DIRECTORY", _check_makefile_path(src_dir))
+
+        # Define BIOS variables.
+        define("LTO", f"{self.bios_lto:d}")
+        if self.bios_console not in ["full", "no-history", "no-autocomplete", "lite", "disable"]:
+            raise ValueError(f"Unsupported BIOS console: {self.bios_console}.")
+        define(f"BIOS_CONSOLE_{self.bios_console.upper()}", "1")
+        if self.bios_no_ansi:
+            define("BIOS_CONSOLE_NO_ANSI", "1")
+        if self.bios_stack_margin is not None:
+            define("BIOS_STACK_MARGIN", str(self.bios_stack_margin))
+
+        return "\n".join(variables_contents)
+
+    def _generate_includes(self, with_bios=True):
         # Generate Include/Generated directories.
         _create_dir(self.include_dir)
         _create_dir(self.generated_dir)
 
+        # Integrate JSON files (only once: the items are merged into the SoC's dicts in place, so a
+        # second build() on the same Builder would raise spurious collision errors).
+        if not self._jsons_merged:
+            self._merge_json_items(self.soc.mem_regions,  self._get_json_mem_regions(), "memory region")
+            self._merge_json_items(self.soc.constants,    self._get_json_constants(),    "constant")
+            self._merge_json_items(self.soc.csr_regions,  self._get_json_csr_regions(),  "CSR region")
+            self._jsons_merged = True
+
         # Generate BIOS files when the SoC uses it.
-        with_bios = self.soc.cpu_type not in [None, "zynq7000"]
         if with_bios:
-
             # Generate Variables to variables.mak.
-            variables_contents = []
-            def define(k, v):
-                variables_contents.append("{}={}".format(k, _makefile_escape(v)))
-
-            # Define the CPU variables.
-            for k, v in export.get_cpu_mak(self.soc.cpu, self.compile_software):
-                define(k, v)
-
-            # Define the SoC/Compiler-RT/Software/Include directories.
-            define("SOC_DIRECTORY",         soc_directory)
-            compiler_rt_directory = get_data_mod("software", "compiler_rt").data_location
-            define("COMPILER_RT_DIRECTORY", compiler_rt_directory)
-            variables_contents.append("export BUILDINC_DIRECTORY")
-            define("BUILDINC_DIRECTORY", self.include_dir)
-            for name, src_dir in self.software_packages:
-                define(name.upper() + "_DIRECTORY", src_dir)
-
-            # Define the BIOS Options.
-            for bios_option in self.bios_options:
-                assert bios_option in ["TERM_NO_HIST", "TERM_MINI", "TERM_NO_COMPLETE"]
-                define(bios_option, "1")
-
-            # Write to variables.mak.
-            write_to_file(os.path.join(self.generated_dir, "variables.mak"), "\n".join(variables_contents))
+            variables_contents = self._get_variables_contents()
+            write_to_file(os.path.join(self.generated_dir, "variables.mak"), variables_contents)
 
             # Generate Output Format to output_format.ld.
             output_format_contents = export.get_linker_output_format(self.soc.cpu)
             write_to_file(os.path.join(self.generated_dir, "output_format.ld"), output_format_contents)
 
             # Generate Memory Regions to regions.ld.
-            regions_contents = export.get_linker_regions(self.soc.mem_regions)
+            regions_contents = export.get_linker_regions(self.soc.mem_regions, cpu=self.soc.cpu)
             write_to_file(os.path.join(self.generated_dir, "regions.ld"), regions_contents)
 
+        # Collect / Generate I2C config and init table.
+        from litex.soc.cores.bitbang import collect_i2c_info
+        i2c_devs, i2c_init = collect_i2c_info(self.soc)
+        if i2c_devs:
+            i2c_info = export.get_i2c_header((i2c_devs, i2c_init))
+            write_to_file(os.path.join(self.generated_dir, "i2c.h"), i2c_info)
+
         # Generate Memory Regions to mem.h.
-        mem_contents = export.get_mem_header(self.soc.mem_regions)
+        mem_contents = export.get_mem_header(self.soc.mem_regions, cpu=self.soc.cpu)
         write_to_file(os.path.join(self.generated_dir, "mem.h"), mem_contents)
 
         # Generate Memory Regions to memory.x if specified.
         if self.memory_x is not None:
             memory_x_contents = export.get_memory_x(self.soc)
-            write_to_file(os.path.realpath(self.memory_x), memory_x_contents)
+            self._export_write(self.memory_x, memory_x_contents)
 
         # Generate SoC Config/Constants to soc.h.
         soc_contents = export.get_soc_header(self.soc.constants)
@@ -173,44 +365,75 @@ class Builder:
 
         # Generate CSR registers definitions/access functions to csr.h.
         csr_contents = export.get_csr_header(
-            regions   = self.soc.csr_regions,
-            constants = self.soc.constants,
-            csr_base  = self.soc.mem_regions['csr'].origin)
+            regions      = self.soc.csr_regions,
+            constants    = self.soc.constants,
+            csr_ordering = self.soc.csr.ordering,
+            csr_base     = self.soc.mem_regions["csr"].origin,
+            cpu          = self.soc.cpu,
+            with_access_functions        = True,
+            with_fields_access_functions = False,
+        )
         write_to_file(os.path.join(self.generated_dir, "csr.h"), csr_contents)
 
         # Generate Git SHA1 of tools to git.h
         git_contents = export.get_git_header()
         write_to_file(os.path.join(self.generated_dir, "git.h"), git_contents)
 
-        # Generate LiteDRAM C header to sdram_phy.h when the SoC use it.
+        # Generate LiteDRAM C header to sdram_phy.h when the SoC use it
         if hasattr(self.soc, "sdram"):
             from litedram.init import get_sdram_phy_c_header
             sdram_contents = get_sdram_phy_c_header(
                 self.soc.sdram.controller.settings.phy,
-                self.soc.sdram.controller.settings.timing)
+                self.soc.sdram.controller.settings.timing,
+                self.soc.sdram.controller.settings.geom)
             write_to_file(os.path.join(self.generated_dir, "sdram_phy.h"), sdram_contents)
+
+    @staticmethod
+    def _export_write(path, contents):
+        # User-specified export paths may point to not-yet-existing directories.
+        path = os.path.realpath(path)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        write_to_file(path, contents)
 
     def _generate_csr_map(self):
         # JSON Export.
         if self.csr_json is not None:
             csr_json_contents = export.get_csr_json(
+                soc         = self.soc,
                 csr_regions = self.soc.csr_regions,
                 constants   = self.soc.constants,
                 mem_regions = self.soc.mem_regions)
-            write_to_file(os.path.realpath(self.csr_json), csr_json_contents)
+            self._export_write(self.csr_json, csr_json_contents)
 
         # CSV Export.
         if self.csr_csv is not None:
             csr_csv_contents = export.get_csr_csv(
+                soc         = self.soc,
                 csr_regions = self.soc.csr_regions,
                 constants   = self.soc.constants,
                 mem_regions = self.soc.mem_regions)
-            write_to_file(os.path.realpath(self.csr_csv), csr_csv_contents)
+            self._export_write(self.csr_csv, csr_csv_contents)
 
         # SVD Export.
         if self.csr_svd is not None:
             csr_svd_contents = export.get_csr_svd(self.soc)
-            write_to_file(os.path.realpath(self.csr_svd), csr_svd_contents)
+            self._export_write(self.csr_svd, csr_svd_contents)
+
+    def _check_meson(self):
+        # Check Meson install/version.
+        meson_present = (shutil.which("meson") is not None)
+        meson_req     = "0.59"
+        if meson_present:
+            meson_version = subprocess.check_output(["meson", "-v"]).decode("utf-8").strip()
+            if Version(meson_version) < Version(meson_req):
+                msg = f"Meson version too old. Found: {meson_version}. Required: {meson_req}.\n"
+                msg += "Try updating with:\n"
+                msg += "- pip3 install -U meson.\n"
+                raise OSError(msg)
+        else:
+            msg = "Unable to find valid Meson build system, please install it with:\n"
+            msg += "- pip3 install meson.\n"
+            raise OSError(msg)
 
     def _prepare_rom_software(self):
         # Create directories for all software packages.
@@ -219,7 +442,8 @@ class Builder:
 
     def _generate_rom_software(self, compile_bios=True):
         # Compile all software packages.
-         for name, src_dir in self.software_packages:
+        cpu_count = os.cpu_count() or 1
+        for name, src_dir in self.software_packages:
             # Skip BIOS compilation when disabled.
             if name == "bios" and not compile_bios:
                 continue
@@ -227,32 +451,244 @@ class Builder:
             dst_dir  = os.path.join(self.software_dir, name)
             makefile = os.path.join(src_dir, "Makefile")
             if self.compile_software:
-                subprocess.check_call(["make", "-C", dst_dir, "-f", makefile])
+                subprocess.check_call(["make", f"-j{cpu_count}", "-C", dst_dir, "-f", makefile])
 
     def _initialize_rom_software(self):
         # Get BIOS data from compiled BIOS binary.
         bios_file = os.path.join(self.software_dir, "bios", "bios.bin")
-        bios_data = soc_core.get_mem_data(bios_file, self.soc.cpu.endianness)
+        bios_data = soc.get_mem_data(bios_file,
+            data_width = self.soc.bus.data_width,
+            endianness = self.soc.cpu.endianness,
+        )
 
-        # Initialize SoC with with BIOS data.
-        self.soc.initialize_rom(bios_data)
+        # Initialize SoC with BIOS data.
+        if not self.integrated_rom_auto_size:
+            # Keep the integrated ROM at the region size selected during SoC
+            # construction. Pad the unused tail so the ROM window and backing
+            # memory remain consistent and deterministic.
+            rom_region = self.soc.bus.regions["rom"]
+            word_bytes = self.soc.bus.data_width // 8
+            rom_depth  = rom_region.size // word_bytes
+            if len(bios_data) < rom_depth:
+                bios_data = bios_data + [0] * (rom_depth - len(bios_data))
+        self.soc.init_rom(
+            name      = "rom",
+            contents  = bios_data,
+            auto_size = self.integrated_rom_auto_size)
+
+    def get_build_log_filename(self):
+        if not self.build_log:
+            return None
+        if isinstance(self.build_log, str):
+            return os.path.abspath(self.build_log)
+        return os.path.join(self.output_dir, "litex.log")
+
+    def _get_source_support_paths(self):
+        paths = []
+        try:
+            paths.append(get_data_mod("software", "picolibc").data_location)
+        except Exception:
+            pass
+        try:
+            paths.append(get_data_mod("software", "compiler_rt").data_location)
+        except Exception:
+            pass
+        try:
+            paths.append(os.path.dirname(inspect.getfile(self.soc.cpu.__class__)))
+        except Exception:
+            pass
+        return paths
+
+    def _create_build_bundle(self, with_bios, platform_sources):
+        if not self.build_bundle:
+            self.last_build_bundle = None
+            return
+
+        bundle = BuildBundle(
+            output_dir    = self.output_dir,
+            archive_path  = self.build_bundle_path,
+            command       = [sys.executable] + sys.argv,
+            strict        = self.bundle_strict,
+            exclude_dirs  = [self.output_dir],
+        )
+
+        # User-selected roots/includes.
+        for path in self.bundle_root:
+            bundle.add_root(path, role="bundle_root")
+        for path in self.bundle_include:
+            bundle.add_path(path, role="bundle_include")
+        for path in self.bundle_pythonpath_root:
+            bundle.add_pythonpath(path, role="pythonpath")
+        if self.bundle_auto_pythonpath:
+            for path in get_pythonpath_roots():
+                bundle.add_pythonpath(path, role="pythonpath_auto")
+
+        # The target script is often the smallest useful handle for replay/debug.
+        if sys.argv and sys.argv[0] and os.path.exists(sys.argv[0]):
+            bundle.add_path(sys.argv[0], role="command")
+
+        # Gateware inputs resolved through the platform.
+        for source in platform_sources:
+            if not source:
+                continue
+            filename = source[0]
+            if os.path.isabs(filename) or os.path.exists(filename):
+                bundle.add_path(filename, role="gateware_source")
+        for path in getattr(self.soc.platform, "verilog_include_paths", []):
+            bundle.add_path(path, role="verilog_include_path")
+
+        # JSON imports.
+        for filename, *_ in self.jsons:
+            bundle.add_path(filename, role="csr_json")
+
+        # Software inputs are only used when a BIOS/ROM software build is in play.
+        if with_bios and getattr(self.soc.cpu, "use_rom", False):
+            for _, src_dir in self.software_packages:
+                bundle.add_path(src_dir, role="software_package")
+            for path in self._get_source_support_paths():
+                bundle.add_path(path, role="software_support")
+
+        self.last_build_bundle = bundle.create()
+
+    # Build Info -----------------------------------------------------------------------------------
+
+    BUILD_INFO_VERSION = 1
+
+    def get_build_info_filename(self):
+        return os.path.join(self.output_dir, "build_info.json")
+
+    def _get_build_info(self, run, status, start, end=None):
+        soc      = self.soc
+        platform = soc.platform
+        cpu      = getattr(soc, "cpu", None)
+
+        def exists(filename):
+            return filename if (filename is not None and os.path.exists(filename)) else None
+
+        try:
+            bitstream = self.get_bitstream_filename()
+        except Exception:
+            bitstream = None
+        bios = self.get_bios_filename() if getattr(cpu, "use_rom", False) else None
+        analyzer_csvs = [f for f in _get_analyzer_csvs(soc) if os.path.exists(f)]
+
+        revision = get_litex_git_revision()
+        return {
+            "version" : self.BUILD_INFO_VERSION,
+            "litex"   : {
+                "git_revision" : None if revision.startswith("-") else revision,
+                "repositories" : _get_git_revisions(),
+            },
+            "command" : {
+                "python" : sys.executable,
+                "argv"   : list(sys.argv),
+                "cwd"    : os.getcwd(),
+            },
+            "platform" : {
+                "name"      : getattr(platform, "name",   None),
+                "device"    : getattr(platform, "device", None),
+                "toolchain" : type(getattr(platform, "toolchain", None)).__name__ if hasattr(platform, "toolchain") else None,
+            },
+            "soc" : {
+                "build_name"   : soc.get_build_name(),
+                "sys_clk_freq" : getattr(soc, "sys_clk_freq", None),
+                "cpu_type"     : getattr(soc, "cpu_type", None),
+                "cpu_variant"  : getattr(cpu, "variant", None) if getattr(soc, "cpu_type", None) else None,
+            },
+            "files" : {
+                "output_dir"   : self.output_dir,
+                "gateware_dir" : self.gateware_dir,
+                "software_dir" : exists(self.software_dir),
+                "csr_csv"      : exists(self.csr_csv  and os.path.abspath(self.csr_csv)),
+                "csr_json"     : exists(self.csr_json and os.path.abspath(self.csr_json)),
+                "csr_svd"      : exists(self.csr_svd  and os.path.abspath(self.csr_svd)),
+                "build_log"    : self.get_build_log_filename(),
+                "bitstream"    : bitstream,
+                "bios"         : exists(bios),
+                "analyzer_csv" : analyzer_csvs[0] if analyzer_csvs else None,
+            },
+            "build" : {
+                "run"        : bool(run),
+                "status"     : status,
+                "started"    : datetime.datetime.fromtimestamp(start).isoformat(timespec="seconds"),
+                "finished"   : None if end is None else datetime.datetime.fromtimestamp(end).isoformat(timespec="seconds"),
+                "duration_s" : None if end is None else round(end - start, 1),
+            },
+        }
+
+    def _write_build_info(self, run, status, start, end=None):
+        # Best effort: build_info.json describes the build for tools/agents, it must never make a build fail.
+        try:
+            info     = self._get_build_info(run, status, start, end)
+            filename = self.get_build_info_filename()
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            with open(filename + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(info, f, indent=4, default=str)
+                f.write("\n")
+            os.replace(filename + ".tmp", filename)
+        except Exception as e:
+            logging.getLogger("Builder").warning(f"Unable to write build_info.json ({e}).")
+
+    # Build ----------------------------------------------------------------------------------------
 
     def build(self, **kwargs):
+        with build_log_context(self.get_build_log_filename()):
+            return self._build(**kwargs)
+
+    def _build(self, **kwargs):
         # Pass Output Directory to Platform.
         self.soc.platform.output_dir = self.output_dir
 
-        # Create Gateware/Software directories.
+        # Check if BIOS is used and add software package if so.
+        with_bios = self.soc.cpu_type is not None
+        if with_bios and not self._has_software_package("bios"):
+            self.add_software_package("bios")
+        if with_bios:
+            self.soc.cpu.add_software_packages(self)
+
+        # Create Gateware directory.
         _create_dir(self.gateware_dir)
-        _create_dir(self.software_dir)
+
+        # Copy Sources to Gateware directory (Optional).
+        bundle_platform_sources = list(self.soc.platform.sources)
+        for i, (f, language, library, *copy) in enumerate(self.soc.platform.sources):
+            if len(copy) and copy[0]:
+                shutil.copy(f, self.gateware_dir)
+                f = os.path.basename(f)
+            self.soc.platform.sources[i] = (f, language, library)
+
+        # Create Software directory.
+        # First check if software needs a full re-build and remove software dir if so.
+        if with_bios:
+            software_full_rebuild  = False
+            software_variables_mak = os.path.join(self.generated_dir, "variables.mak")
+            if self.compile_software and os.path.exists(software_variables_mak):
+                with open(software_variables_mak) as f:
+                    old_variables_contents = f.read()
+                new_variables_contents = self._get_variables_contents()
+                software_full_rebuild  = (old_variables_contents != new_variables_contents)
+            _create_dir(self.software_dir, remove_if_exists=software_full_rebuild)
 
         # Finalize the SoC.
         self.soc.finalize()
+        if with_bios:
+            self.soc.cpu.prepare_software(self)
+        bundle_platform_sources += [
+            source for source in self.soc.platform.sources
+            if source not in bundle_platform_sources
+        ]
 
         # Generate Software Includes/Files.
-        self._generate_includes()
+        self._generate_includes(with_bios=with_bios)
 
         # Export SoC Mapping.
         self._generate_csr_map()
+
+        # Archive resolved build inputs before invoking external tools.
+        self._create_build_bundle(
+            with_bios        = with_bios,
+            platform_sources = bundle_platform_sources,
+        )
 
         # Compile the BIOS when the SoC uses it.
         if self.soc.cpu_type is not None:
@@ -266,59 +702,135 @@ class Builder:
                 )
                 if use_bios:
                     self.soc.check_bios_requirements()
+                    self._check_meson()
                 self._prepare_rom_software()
                 self._generate_rom_software(compile_bios=use_bios)
 
+            # Initialize Memories.
+            # Allow User Design to optionally initialize Memories through SoC.init_ram/init_rom.
+            if hasattr(self.soc, "init_mems"):
+                self.soc.init_mems(**kwargs)
+
+            if self.soc.cpu.use_rom:
                 # Initialize ROM.
                 if use_bios and self.soc.integrated_rom_size:
-                    self._initialize_rom_software()
+                    # Only initialize if not already initialized.
+                    if not getattr(self.soc, "rom").mem.init:
+                        self._initialize_rom_software()
 
         # Translate compile_gateware to run.
         if "run" not in kwargs:
             kwargs["run"] = self.compile_gateware
 
-        # Build SoC and pass Verilog Name Space to do_exit.
-        vns = self.soc.build(build_dir=self.gateware_dir, **kwargs)
-        self.soc.do_exit(vns=vns)
+        if "hierarchical" not in kwargs:
+            kwargs["hierarchical"] = self.hierarchical
+
+        kwargs["build_backend"] = self.build_backend
+
+        # Build SoC and pass Verilog Name Space to do_exit (build_info.json tracks the build status).
+        start = time.time()
+        self._write_build_info(kwargs["run"], "running", start)
+        try:
+            vns = self.soc.build(build_dir=self.gateware_dir, **kwargs)
+            self.soc.do_exit(vns=vns)
+        except BaseException as e:
+            status = "interrupted" if isinstance(e, KeyboardInterrupt) else "failed"
+            self._write_build_info(kwargs["run"], status, start, time.time())
+            raise
+        self._write_build_info(kwargs["run"], "succeeded", start, time.time())
 
         # Generate SoC Documentation.
         if self.generate_doc:
             from litex.soc.doc import generate_docs
             doc_dir = os.path.join(self.output_dir, "doc")
             generate_docs(self.soc, doc_dir)
-            os.system(f"sphinx-build -M html {doc_dir} {doc_dir}/_build")
+            subprocess.check_call([
+                "sphinx-build", "-M", "html", doc_dir, os.path.join(doc_dir, "_build")
+            ])
 
         return vns
+
+    def get_bios_filename(self):
+        return os.path.join(self.software_dir, "bios", "bios.bin")
+
+    def get_bitstream_filename(self, mode="sram", ext=None):
+        if mode not in ["sram", "flash"]:
+            raise ValueError(f"Unsupported bitstream mode: {mode}.")
+        if ext is None:
+            ext = self.soc.platform.get_bitstream_extension(mode)
+        return os.path.join(self.gateware_dir, self.soc.get_build_name() + ext)
 
 # Builder Arguments --------------------------------------------------------------------------------
 
 def builder_args(parser):
-    parser.add_argument("--output-dir",          default=None,        help="Base Output directory (customizable with --{gateware,software,include,generated}-dir).")
-    parser.add_argument("--gateware-dir",        default=None,        help="Output directory for Gateware files.")
-    parser.add_argument("--software-dir",        default=None,        help="Output directory for Software files.")
-    parser.add_argument("--include-dir",         default=None,        help="Output directory for Header files.")
-    parser.add_argument("--generated-dir",       default=None,        help="Output directory for Generated files.")
-    parser.add_argument("--no-compile-software", action="store_true", help="Disable Software compilation.")
-    parser.add_argument("--no-compile-gateware", action="store_true", help="Disable Gateware compilation.")
-    parser.add_argument("--csr-csv",             default=None,        help="Write SoC mapping to the specified CSV file.")
-    parser.add_argument("--csr-json",            default=None,        help="Write SoC mapping to the specified JSON file.")
-    parser.add_argument("--csr-svd",             default=None,        help="Write SoC mapping to the specified SVD file.")
-    parser.add_argument("--memory-x",            default=None,        help="Write SoC Memory Regions to the specified Memory-X file.")
-    parser.add_argument("--doc",                 action="store_true", help="Generate SoC Documentation.")
-
+    parser.formatter_class = lambda prog: argparse.ArgumentDefaultsHelpFormatter(prog, max_help_position=10, width=120)
+    builder_group = parser.add_argument_group(title="Builder options")
+    export_help = (
+        "Generated when the Builder build step runs; "
+        "on board targets, use --build --no-compile for export only."
+    )
+    builder_group.add_argument("--output-dir",            default=None,        help="Base output directory.")
+    builder_group.add_argument("--gateware-dir",          default=None,        help="Output directory for gateware files.")
+    builder_group.add_argument("--software-dir",          default=None,        help="Output directory for software files.")
+    builder_group.add_argument("--include-dir",           default=None,        help="Output directory for header files.")
+    builder_group.add_argument("--generated-dir",         default=None,        help="Output directory for generated files.")
+    builder_group.add_argument("--build-backend",         default="litex",     choices=["litex", "edalize"], help="Select build backend.")
+    builder_group.add_argument("--build-log",             default=True, nargs="?", const=True, help="Write build log to file (default: output_dir/litex.log).")
+    builder_group.add_argument("--no-build-log",          dest="build_log", action="store_false", help="Disable build log generation.")
+    builder_group.add_argument("--no-compile",            action="store_true", help="Disable software and gateware compilation.")
+    builder_group.add_argument("--no-compile-software",   action="store_true", help="Disable software compilation only.")
+    builder_group.add_argument("--no-compile-gateware",   action="store_true", help="Disable gateware compilation only.")
+    builder_group.add_argument("--soc-csv", "--csr-csv",  default=None,        help=f"Write SoC mapping to the specified CSV file (always generated, default: <output-dir>/csr.csv). {export_help}")
+    builder_group.add_argument("--soc-json", "--csr-json", default=None,       help=f"Write SoC mapping to the specified JSON file (always generated, default: <output-dir>/csr.json). {export_help}")
+    builder_group.add_argument("--soc-svd", "--csr-svd",  default=None,        help=f"Write SoC mapping to the specified SVD file. {export_help}")
+    builder_group.add_argument("--memory-x",              default=None,        help=f"Write SoC memory regions to the specified Memory-X file. {export_help}")
+    builder_group.add_argument("--doc",                   action="store_true", help="Generate SoC documentation.")
+    builder_group.add_argument("--hierarchical-verilog",  action="store_true", help="Enable hierarchical Verilog generation.")
+    bundle_group = parser.add_argument_group(title="Build bundle options")
+    bundle_group.add_argument("--build-bundle",           default=False, nargs="?", const=True, metavar="PATH", help="Generate build input bundle (optionally to PATH).")
+    bundle_group.add_argument("--no-build-bundle",        dest="build_bundle", action="store_false",           help="Disable build input bundle generation.")
+    bundle_group.add_argument("--bundle-root",            default=[], action="append",                         help="Add directory root to bundle.")
+    bundle_group.add_argument("--bundle-include",         default=[], action="append",                         help="Add extra file/directory to bundle.")
+    bundle_group.add_argument("--bundle-pythonpath-root", default=[], action="append",                         help="Add Python import root to bundle.")
+    bundle_group.add_argument("--bundle-auto-pythonpath", action="store_true",                                 help="Auto-bundle LiteX Python import roots.")
+    bundle_group.add_argument("--bundle-strict",          default="warn", choices=["warn", "error"],           help="Missing bundle input handling.")
+    bios_group = parser.add_argument_group(title="BIOS options") # FIXME: Move?
+    bios_group.add_argument("--bios-lto",     action="store_true", help="Enable BIOS LTO (Link Time Optimization) compilation.")
+    bios_group.add_argument("--bios-format",  default="integer",   help="Select BIOS printf format.",  choices=["integer", "float", "double"])
+    bios_group.add_argument("--bios-console", default="full",      help="Select BIOS console config.", choices=["full", "no-history", "no-autocomplete", "lite", "disable"])
+    bios_group.add_argument("--bios-no-ansi", action="store_true", help="Disable ANSI escape sequences in BIOS output.")
+    bios_group.add_argument("--bios-stack-margin", default=None, type=soc.auto_int, help="Fail BIOS build when available stack space is below this byte count.")
+    bios_group.add_argument("--libc-mode",    default="minimal",   help="Select LiteX libc build mode.", choices=["full", "minimal"])
+    bios_group.add_argument("--no-integrated-rom-auto-size", action="store_true", help="Keep integrated ROM at requested size instead of auto-resizing it to the BIOS size.")
 
 def builder_argdict(args):
     return {
-        "output_dir":       args.output_dir,
-        "gateware_dir":     args.gateware_dir,
-        "software_dir":     args.software_dir,
-        "include_dir":      args.include_dir,
-        "generated_dir":    args.generated_dir,
-        "compile_software": not args.no_compile_software,
-        "compile_gateware": not args.no_compile_gateware,
-        "csr_csv":          args.csr_csv,
-        "csr_json":         args.csr_json,
-        "csr_svd":          args.csr_svd,
-        "memory_x":         args.memory_x,
-        "generate_doc":     args.doc,
+        "output_dir"               : args.output_dir,
+        "gateware_dir"             : args.gateware_dir,
+        "software_dir"             : args.software_dir,
+        "include_dir"              : args.include_dir,
+        "generated_dir"            : args.generated_dir,
+        "build_backend"            : args.build_backend,
+        "build_log"                : args.build_log,
+        "compile_software"         : (not args.no_compile) and (not args.no_compile_software),
+        "compile_gateware"         : (not args.no_compile) and (not args.no_compile_gateware),
+        "csr_csv"                  : args.soc_csv,
+        "csr_json"                 : args.soc_json,
+        "csr_svd"                  : args.soc_svd,
+        "memory_x"                 : args.memory_x,
+        "generate_doc"             : args.doc,
+        "bios_lto"                 : args.bios_lto,
+        "bios_format"              : args.bios_format,
+        "bios_console"             : args.bios_console,
+        "bios_no_ansi"             : args.bios_no_ansi,
+        "bios_stack_margin"        : args.bios_stack_margin,
+        "libc_mode"                : args.libc_mode,
+        "integrated_rom_auto_size" : not args.no_integrated_rom_auto_size,
+        "hierarchical"             : args.hierarchical_verilog,
+        "build_bundle"             : args.build_bundle,
+        "bundle_root"              : args.bundle_root,
+        "bundle_include"           : args.bundle_include,
+        "bundle_pythonpath_root"   : args.bundle_pythonpath_root,
+        "bundle_auto_pythonpath"   : args.bundle_auto_pythonpath,
+        "bundle_strict"            : args.bundle_strict,
     }

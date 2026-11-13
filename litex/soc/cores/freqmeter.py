@@ -8,11 +8,13 @@ from migen import *
 from migen.genlib.cdc import MultiReg, GrayCounter
 from migen.genlib.cdc import GrayDecoder
 
+from litex.gen import *
+
 from litex.soc.interconnect.csr import *
 
 # Sampler ------------------------------------------------------------------------------------------
 
-class _Sampler(Module):
+class _Sampler(LiteXModule):
     def __init__(self, width):
         self.latch = Signal()
         self.i     = Signal(width)
@@ -38,26 +40,22 @@ class _Sampler(Module):
 
 # Freq Meter ---------------------------------------------------------------------------------------
 
-class FreqMeter(Module, AutoCSR):
+class FreqMeter(LiteXModule):
     def __init__(self, period, width=6, clk=None):
         self.clk   = Signal() if clk is None else clk
-        self.value = CSRStatus(32)
+        self.value = CSRStatus(32, description="Measured frequency counter value.")
 
         # # #
 
-        self.clock_domains.cd_fmeter = ClockDomain(reset_less=True)
+        self.cd_fmeter = ClockDomain(reset_less=True)
         self.comb += self.cd_fmeter.clk.eq(self.clk)
 
         # Period generation
         period_done    = Signal()
         period_counter = Signal(32)
         self.comb += period_done.eq(period_counter == period)
-        self.sync += \
-            If(period_done,
-                period_counter.eq(0),
-            ).Else(
-                period_counter.eq(period_counter + 1)
-            )
+        self.sync += period_counter.eq(period_counter + 1)
+        self.sync += If(period_done, period_counter.eq(0))
 
         # Frequency measurement
         event_counter = ClockDomainsRenamer("fmeter")(GrayCounter(width))

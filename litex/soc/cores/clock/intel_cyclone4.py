@@ -12,10 +12,12 @@ from litex.soc.cores.clock.intel_common import *
 # Intel / CycloneIV -------------------------------------------------------------------------------
 
 class CycloneIVPLL(IntelClocking):
+    altpll_dpa     = True
     nclkouts_max   = 5
     n_div_range    = (1, 512+1)
     m_div_range    = (1, 512+1)
     c_div_range    = (1, 512+1)
+    clkin_pfd_freq_range  = (5e6, 325e6)
     vco_freq_range = (600e6, 1300e6)
     def __init__(self, speedgrade="-6"):
         self.logger = logging.getLogger("CycloneIVPLL")

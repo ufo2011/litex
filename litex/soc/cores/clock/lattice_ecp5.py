@@ -1,96 +1,175 @@
 #
 # This file is part of LiteX.
 #
-# Copyright (c) 2018-2020 Florent Kermarrec <florent@enjoy-digital.fr>
+# Copyright (c) 2018-2026 Florent Kermarrec <florent@enjoy-digital.fr>
+# Copyright (c) 2021 George Hilliard <thirtythreeforty@gmail.com>
 # SPDX-License-Identifier: BSD-2-Clause
 
 from migen import *
-from migen.genlib.resetsync import AsyncResetSynchronizer
+
+from litex.gen import *
 
 from litex.soc.cores.clock.common import *
 
-# Lattice / ECP5 -----------------------------------------------------------------------------------
+# Lattice / ECP5 PLL -------------------------------------------------------------------------------
 
-class ECP5PLL(Module):
-    nclkouts_max    = 3
+class ECP5PLL(LiteXModule):
+    nclkouts_max    = 4
     clki_div_range  = (1, 128+1)
     clkfb_div_range = (1, 128+1)
     clko_div_range  = (1, 128+1)
     clki_freq_range = (    8e6,  400e6)
     clko_freq_range = (3.125e6,  400e6)
     vco_freq_range  = (  400e6,  800e6)
+    pfd_freq_range  = (   10e6,  400e6)
+    vco_tie_break   = +1 # Prefer the lower VCO on equal output errors.
 
-    def __init__(self):
+    def __init__(self, bel=None, name=None):
         self.logger = logging.getLogger("ECP5PLL")
         self.logger.info("Creating ECP5PLL.")
         self.reset      = Signal()
         self.locked     = Signal()
+        self.stdby      = Signal()
         self.clkin_freq = None
         self.vcxo_freq  = None
+        self.dpa_en     = False
         self.nclkouts   = 0
         self.clkouts    = {}
         self.config     = {}
         self.params     = {}
+        self.bel        = bel
+        self.name       = name
 
     def register_clkin(self, clkin, freq):
-        (clki_freq_min, clki_freq_max) = self.clki_freq_range
-        assert freq >= clki_freq_min
-        assert freq <= clki_freq_max
-        self.clkin = Signal()
-        if isinstance(clkin, (Signal, ClockSignal)):
-            self.comb += self.clkin.eq(clkin)
-        else:
-            raise ValueError
+        check_freq_range(freq, self.clki_freq_range, "Input clock frequency")
+        self.clkin = connect_clkin(self, clkin)
         self.clkin_freq = freq
         register_clkin_log(self.logger, clkin, freq)
 
-    def create_clkout(self, cd, freq, phase=0, margin=1e-2, with_reset=True):
-        (clko_freq_min, clko_freq_max) = self.clko_freq_range
-        assert freq >= clko_freq_min
-        assert freq <= clko_freq_max
-        assert self.nclkouts < self.nclkouts_max
+    def create_clkout(self, cd, freq, phase=0, margin=1e-2, with_reset=True, uses_dpa=True):
+        check_freq_range(freq, self.clko_freq_range, "Output clock frequency")
+        check_margin(margin)
+        check_clkout_cd_unused(self, cd)
+        check_clkout_count(self.nclkouts, self.nclkouts_max)
         clkout = Signal()
-        self.clkouts[self.nclkouts] = (clkout, freq, phase, margin)
-        if with_reset:
-            self.specials += AsyncResetSynchronizer(cd, ~self.locked)
-        self.comb += cd.clk.eq(clkout)
+        self.clkouts[self.nclkouts] = ClkOutDPA(clkout, freq, phase, margin, uses_dpa)
+        connect_clkout(self, cd, clkout, reset=~self.locked, with_reset=with_reset)
         create_clkout_log(self.logger, cd.name, freq, margin, self.nclkouts)
         self.nclkouts += 1
 
     def compute_config(self):
-        config = {}
+        check_clkin_registered(hasattr(self, "clkin"))
+        check_clkouts(self.nclkouts)
+        best_config = None
+        best_score  = None
+        # Iterate on CLKI dividers...
         for clki_div in range(*self.clki_div_range):
-            config["clki_div"] = clki_div
-            for clkfb_div in range(*self.clkfb_div_range):
-                all_valid = True
-                vco_freq = self.clkin_freq/clki_div*clkfb_div*1 # clkos3_div=1
-                (vco_freq_min, vco_freq_max) = self.vco_freq_range
-                if vco_freq >= vco_freq_min and vco_freq <= vco_freq_max:
-                    for n, (clk, f, p, m) in sorted(self.clkouts.items()):
-                        valid = False
-                        for d in range(*self.clko_div_range):
-                            clk_freq = vco_freq/d
-                            if abs(clk_freq - f) <= f*m:
+            # Check if in PFD range.
+            (pfd_freq_min, pfd_freq_max) = self.pfd_freq_range
+            if not (pfd_freq_min <= self.clkin_freq/clki_div <= pfd_freq_max):
+                continue
+            # Iterate on CLKO dividers... (to get us in VCO range)
+            for clkofb_div in range(*self.clko_div_range):
+                # Iterate on CLKFB dividers...
+                for clkfb_div in range(*self.clkfb_div_range):
+                    errors   = []
+                    config   = {"clki_div": clki_div}
+                    vco_freq = (self.clkin_freq/clki_div)*clkfb_div*clkofb_div
+                    (vco_freq_min, vco_freq_max) = self.vco_freq_range
+                    all_valid = True
+                    # If in VCO range, find dividers for all outputs.
+                    if vco_freq_min <= vco_freq <= vco_freq_max:
+                        config["clkfb"]  = None
+                        clkout_configs   = {}
+                        feedback_configs = {}
+                        for n, clkout in sorted(self.clkouts.items()):
+                            # Only the current feedback divider can serve as feedback.
+                            # Outputs using dynamic phase adjustment cannot be reused.
+                            clk_freq = vco_freq/clkofb_div
+                            error    = clkout_freq_error(clk_freq, clkout.freq)
+                            if error <= clkout.margin and not (clkout.uses_dpa and self.dpa_en):
+                                feedback_configs[n] = (error, clk_freq, clkofb_div, clkout.phase)
+                            best_clkout = clkout_best_divider(
+                                clkout.freq,
+                                clkout.margin,
+                                clkdiv_candidates([self.clko_div_range], ideal=vco_freq/clkout.freq),
+                                lambda d: vco_freq/d
+                            )
+                            if best_clkout is None:
+                                all_valid = False
+                                break
+                            error, clk_freq, d = best_clkout
+                            clkout_configs[n]  = (error, clk_freq, d, clkout.phase)
+                        if all_valid:
+                            for n, (error, clk_freq, d, p) in sorted(clkout_configs.items()):
+                                if n in feedback_configs and d == feedback_configs[n][2]:
+                                    config["clkfb"] = n
+
+                            if config["clkfb"] is None and self.nclkouts == self.nclkouts_max:
+                                best_feedback_score  = None
+                                best_feedback_clkout = None
+                                for n, feedback_config in feedback_configs.items():
+                                    candidate_clkouts    = dict(clkout_configs)
+                                    candidate_clkouts[n] = feedback_config
+                                    candidate_errors     = [clkout[0] for clkout in candidate_clkouts.values()]
+                                    candidate_score      = clkout_config_score(
+                                        candidate_errors, vco_freq, self.vco_tie_break)
+                                    if best_feedback_score is None or candidate_score < best_feedback_score:
+                                        best_feedback_score  = candidate_score
+                                        best_feedback_clkout = n
+                                if best_feedback_clkout is None:
+                                    # If there is no output suitable for feedback and no spare, not valid
+                                    all_valid = False
+                                else:
+                                    clkout_configs[best_feedback_clkout] = feedback_configs[best_feedback_clkout]
+                                    config["clkfb"] = best_feedback_clkout
+
+                        if all_valid:
+                            errors = []
+                            for n, (error, clk_freq, d, p) in sorted(clkout_configs.items()):
+                                errors.append(error)
                                 config["clko{}_freq".format(n)]  = clk_freq
                                 config["clko{}_div".format(n)]   = d
                                 config["clko{}_phase".format(n)] = p
-                                valid = True
-                                break
-                        if not valid:
-                            all_valid = False
-                else:
-                    all_valid = False
-                if all_valid:
-                    config["vco"] = vco_freq
-                    config["clkfb_div"] = clkfb_div
-                    compute_config_log(self.logger, config)
-                    return config
-        raise ValueError("No PLL config found")
+                    else:
+                        all_valid = False
+                    if all_valid:
+                        # Reserve a spare output for feedback when no requested output is suitable.
+                        if config["clkfb"] is None:
+                            feedback_clkout = self.nclkouts
+                            config["clkfb"] = feedback_clkout
+                            config[f"clko{feedback_clkout}_div"] = clkofb_div
+                        config["vco"]       = vco_freq
+                        config["clkfb_div"] = clkfb_div
+                        best_config, best_score = update_best_config(
+                            best_config, best_score, config, errors, vco_freq, self.vco_tie_break)
+        if best_config is not None:
+            compute_config_log(self.logger, best_config)
+            return best_config
+        raise pll_config_error(self.clkin_freq, self.clkouts)
+
+    def expose_dpa(self):
+        self.dpa_en     = True
+        self.phase_sel  = Signal(2)
+        self.phase_dir  = Signal()
+        self.phase_step = Signal()
+        self.phase_load = Signal()
+
+        # # #
+
+        self.params.update(
+            p_DPHASE_SOURCE = "ENABLED",
+            i_PHASESEL0     = self.phase_sel[0],
+            i_PHASESEL1     = self.phase_sel[1],
+            i_PHASEDIR      = self.phase_dir,
+            i_PHASESTEP     = self.phase_step,
+            i_PHASELOADREG  = self.phase_load
+        )
 
     def do_finalize(self):
         config = self.compute_config()
-        clkfb  = Signal()
         locked = Signal()
+        n_to_l = {0: "P", 1: "S", 2: "S2", 3: "S3"}
         self.params.update(
             attr=[
                 ("FREQUENCY_PIN_CLKI",     str(self.clkin_freq/1e6)),
@@ -100,23 +179,84 @@ class ECP5PLL(Module):
                 ("MFG_GMCREF_SEL",         "2")],
             i_RST           = self.reset,
             i_CLKI          = self.clkin,
+            i_STDBY         = self.stdby,
             o_LOCK          = locked,
-            p_FEEDBK_PATH   = "INT_OS3", # CLKOS3 reserved for feedback with div=1.
-            p_CLKOS3_ENABLE = "ENABLED",
-            p_CLKOS3_DIV    = 1,
-            p_CLKOS3_FPHASE = 0,
-            p_CLKOS3_CPHASE = 23,
+            p_FEEDBK_PATH   = f"INT_O{n_to_l[config['clkfb']]}",
             p_CLKFB_DIV     = config["clkfb_div"],
-            p_CLKI_DIV      = config["clki_div"],
+            p_CLKI_DIV      = config["clki_div"]
         )
         self.comb += self.locked.eq(locked & ~self.reset)
-        for n, (clk, f, p, m) in sorted(self.clkouts.items()):
-            n_to_l = {0: "P", 1: "S", 2: "S2"}
-            div    = config["clko{}_div".format(n)]
-            cphase = int(p*(div + 1)/360 + div - 1)
-            self.params["p_CLKO{}_ENABLE".format(n_to_l[n])] = "ENABLED"
-            self.params["p_CLKO{}_DIV".format(n_to_l[n])]    = div
-            self.params["p_CLKO{}_FPHASE".format(n_to_l[n])] = 0
-            self.params["p_CLKO{}_CPHASE".format(n_to_l[n])] = cphase
-            self.params["o_CLKO{}".format(n_to_l[n])]        = clk
-        self.specials += Instance("EHXPLLL", **self.params)
+        clkouts = dict(self.clkouts)
+        if config["clkfb"] not in clkouts:
+            clkouts[config["clkfb"]] = ClkOutDPA(Signal(), 0, 0, 0, False)
+        for n, clkout in sorted(clkouts.items()):
+            div    = config[f"clko{n}_div"]
+            phase  = round(clkout.phase*div/45)
+            self.params[f"p_CLKO{n_to_l[n]}_ENABLE"] = "ENABLED"
+            self.params[f"p_CLKO{n_to_l[n]}_DIV"]    = div
+            self.params[f"p_CLKO{n_to_l[n]}_FPHASE"] = phase & 7
+            self.params[f"p_CLKO{n_to_l[n]}_CPHASE"] = (phase >> 3) + (div - 1)
+            self.params[f"o_CLKO{n_to_l[n]}"]        = clkout.clk
+            if clkout.freq > 0:  # i.e. not a feedback-only clock
+                self.params["attr"].append((f"FREQUENCY_PIN_CLKO{n_to_l[n]}", str(clkout.freq/1e6)))
+        if self.bel:
+            self.params["attr"].append(("BEL", self.bel))
+        self.specials += Instance("EHXPLLL", name=self.name or "", **self.params)
+
+# Lattice / ECP5 Dynamic Delay ---------------------------------------------------------------------
+
+class ECP5DynamicDelay(LiteXModule):
+    tap_delay = 25e-12
+    ntaps     = 128
+
+    def __init__(self, i=None, o=None, taps=None):
+        self.i    = Signal() if i is None else i
+        self.o    = Signal() if o is None else o
+        self.taps = Signal(max=self.ntaps) if taps is None else taps
+
+        # # #
+
+        rst       = Signal()
+        move      = Signal()
+        done      = Signal()
+        change    = Signal()
+        curr_taps = Signal(max=self.ntaps)
+
+        # DELAYF Instance.
+        self.specials += Instance("DELAYF",
+            p_DEL_MODE  = "USER_DEFINED",
+            p_DEL_VALUE = self.taps.reset,
+            i_A         = self.i,
+            o_Z         = self.o,
+            i_LOADN     = ~(ResetSignal() | rst),
+            i_MOVE      = move,
+            i_DIRECTION = 0,
+            o_CFLAG     = Signal()
+        )
+
+        # FSM.
+        self.comb += done.eq(  self.taps == curr_taps)
+        self.comb += change.eq(self.taps != curr_taps)
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        fsm.act("IDLE",
+            If(change,
+                NextState("DELAYF-RST")
+            )
+        )
+        fsm.act("DELAYF-RST",
+            rst.eq(1),
+            NextValue(move,      0),
+            NextValue(curr_taps, 0),
+            NextState("DELAYF-MOVE")
+        )
+        fsm.act("DELAYF-MOVE",
+             If(done,
+                NextValue(move, 0),
+                NextState("IDLE")
+            ).Else(
+                NextValue(move, ~move),
+                If(move,
+                    NextValue(curr_taps, curr_taps + 1)
+                )
+            )
+        )

@@ -1,4 +1,4 @@
-// This file is Copyright (c) 2014-2020 Florent Kermarrec <florent@enjoy-digital.fr>
+// This file is Copyright (c) 2014-2021 Florent Kermarrec <florent@enjoy-digital.fr>
 // This file is Copyright (c) 2013-2014 Sebastien Bourdeauducq <sb@m-labs.hk>
 // This file is Copyright (c) 2018 Ewen McNeill <ewen@naos.co.nz>
 // This file is Copyright (c) 2018 Felix Held <felix-github@felixheld.de>
@@ -9,11 +9,9 @@
 
 #include <stdio.h>
 #include <stdint.h>
+#include <limits.h>
 #include <stdlib.h>
-#include <console.h>
-#include <uart.h>
 #include <system.h>
-#include <crc.h>
 #include <string.h>
 #include <irq.h>
 
@@ -23,24 +21,26 @@
 
 #include "sfl.h"
 #include "boot.h"
-#include "jsmn.h"
+#include "helpers.h"
 
-#include <progress.h>
+#include <libbase/uart.h>
+
+#include <libbase/console.h>
+#include <libbase/crc.h>
+#include <libbase/jsmn.h>
+#include <libbase/progress.h>
+#include <libbase/parse.h>
 
 #include <libliteeth/udp.h>
 #include <libliteeth/tftp.h>
+#ifdef ETH_WITH_DHCP
+#include <libliteeth/dhcp.h>
+#endif
 
 #include <liblitesdcard/spisdcard.h>
 #include <liblitesdcard/sdcard.h>
 #include <liblitesata/sata.h>
 #include <libfatfs/ff.h>
-
-/*-----------------------------------------------------------------------*/
-/* Helpers                                                               */
-/*-----------------------------------------------------------------------*/
-
-#define max(x, y) (((x) > (y)) ? (x) : (y))
-#define min(x, y) (((x) < (y)) ? (x) : (y))
 
 /*-----------------------------------------------------------------------*/
 /* Boot                                                                  */
@@ -51,7 +51,7 @@ extern void boot_helper(unsigned long r1, unsigned long r2, unsigned long r3, un
 void __attribute__((noreturn)) boot(unsigned long r1, unsigned long r2, unsigned long r3, unsigned long addr)
 {
 	printf("Executing booted program at 0x%08lx\n\n", addr);
-	printf("--============= \e[1mLiftoff!\e[0m ===============--\n");
+	bios_print_section("Liftoff!");
 #ifdef CSR_UART_BASE
 	uart_sync();
 #endif
@@ -63,7 +63,8 @@ void __attribute__((noreturn)) boot(unsigned long r1, unsigned long r2, unsigned
 	flush_cpu_dcache();
 	flush_l2_cache();
 
-#if defined(CONFIG_CPU_TYPE_MOR1KX) && defined(CONFIG_CPU_VARIANT_LINUX)
+#if (defined(CONFIG_CPU_TYPE_MOR1KX) || defined(CONFIG_CPU_TYPE_MAROCCHINO)) \
+     && defined(CONFIG_CPU_VARIANT_LINUX)
 	/* Mainline Linux expects to have exception vector base address set to the
 	 * base address of Linux kernel; it also expects to be run with an offset
 	 * of 0x100. */
@@ -80,6 +81,82 @@ enum {
 	ACK_CANCELLED,
 	ACK_OK
 };
+
+#if defined(MAIN_RAM_BASE) || defined(MAIN_RAM_BASE_VA) || defined(SRAM_BASE) || defined(SRAM_BASE_VA) || defined(SPIFLASH_BASE) || defined(FLASH_BOOT_REGION_BASE)
+static int boot_region_max_size(unsigned long addr, unsigned long base, unsigned long size, size_t *max_size)
+{
+	/* Compare offsets instead of region end so that regions ending exactly at
+	   the top of the address space (base + size wrapping to 0) are accepted. */
+	if ((addr < base) || ((addr - base) >= size))
+		return 0;
+
+	*max_size = size - (addr - base);
+	return 1;
+}
+#endif
+
+/* Compare physical addresses so aliases cannot bypass load reservations. */
+static unsigned long boot_physical_address(unsigned long addr)
+{
+#if defined(MAIN_RAM_BASE) && defined(MAIN_RAM_BASE_VA)
+	if (addr >= MAIN_RAM_BASE_VA && addr - MAIN_RAM_BASE_VA < MAIN_RAM_SIZE)
+		return MAIN_RAM_BASE + (addr - MAIN_RAM_BASE_VA);
+#endif
+#if defined(SRAM_BASE) && defined(SRAM_BASE_VA)
+	if (addr >= SRAM_BASE_VA && addr - SRAM_BASE_VA < SRAM_SIZE)
+		return SRAM_BASE + (addr - SRAM_BASE_VA);
+#endif
+	return addr;
+}
+
+#ifdef SRAM_BASE
+#define BIOS_SRAM_BASE SRAM_BASE
+#elif defined(SRAM_BASE_VA)
+#define BIOS_SRAM_BASE SRAM_BASE_VA
+#endif
+
+static int boot_load_max_size(unsigned long addr, size_t *max_size)
+{
+	unsigned long physical = boot_physical_address(addr);
+	int found = 0;
+
+#ifdef BIOS_SRAM_BASE
+	/* SRAM holds the BIOS runtime and its growing stack. Only a buffer
+	   explicitly reserved by the linker is available for image loading.
+	   Custom linker scripts without these symbols reserve all SRAM. */
+	extern char __bios_boot_sram_start[] __attribute__((weak));
+	extern char __bios_boot_sram_end[] __attribute__((weak));
+	unsigned long start = boot_physical_address((unsigned long)__bios_boot_sram_start);
+	unsigned long end = boot_physical_address((unsigned long)__bios_boot_sram_end);
+	size_t available;
+
+	if (boot_region_max_size(physical, BIOS_SRAM_BASE, SRAM_SIZE, &available)) {
+		if (end > start && start >= BIOS_SRAM_BASE &&
+		    start - BIOS_SRAM_BASE < SRAM_SIZE &&
+		    end - start <= SRAM_SIZE - (start - BIOS_SRAM_BASE) &&
+		    boot_region_max_size(physical, start, end - start, max_size))
+			return 1;
+		printf("Error: boot load address 0x%08lx overlaps BIOS SRAM\n", addr);
+		return 0;
+	}
+#endif
+#ifdef MAIN_RAM_BASE
+	found = boot_region_max_size(physical, MAIN_RAM_BASE, MAIN_RAM_SIZE, max_size);
+#elif defined(MAIN_RAM_BASE_VA)
+	found = boot_region_max_size(physical, MAIN_RAM_BASE_VA, MAIN_RAM_SIZE, max_size);
+#endif
+	if (found) {
+#ifdef BIOS_SRAM_BASE
+		/* A target may carve its SRAM reservation out of main RAM. */
+		if (physical < BIOS_SRAM_BASE && *max_size > BIOS_SRAM_BASE - physical)
+			*max_size = BIOS_SRAM_BASE - physical;
+#endif
+		return 1;
+	}
+
+	printf("Error: boot load address 0x%08lx is outside writable memory\n", addr);
+	return 0;
+}
 
 /*-----------------------------------------------------------------------*/
 /* ROM Boot                                                              */
@@ -103,20 +180,27 @@ void romboot(void)
 
 #ifdef CSR_UART_BASE
 
-static int check_ack(void)
-{
-	int recognized;
-	static const char str[SFL_MAGIC_LEN] = SFL_MAGIC_ACK;
+#define ACK_TIMEOUT_DELAY CONFIG_CLOCK_FREQUENCY/4
+#define CMD_TIMEOUT_DELAY CONFIG_CLOCK_FREQUENCY/4
 
+static void timer0_load(unsigned int value) {
 	timer0_en_write(0);
 	timer0_reload_write(0);
-#ifndef CONFIG_DISABLE_DELAYS
-	timer0_load_write(CONFIG_CLOCK_FREQUENCY/4);
+#ifndef CONFIG_BIOS_NO_DELAYS
+	timer0_load_write(value);
 #else
 	timer0_load_write(0);
 #endif
 	timer0_en_write(1);
 	timer0_update_value_write(1);
+}
+
+static int check_ack(void)
+{
+	int recognized;
+	static const char str[SFL_MAGIC_LEN] = SFL_MAGIC_ACK;
+
+	timer0_load(ACK_TIMEOUT_DELAY);
 	recognized = 0;
 	while(timer0_value_read()) {
 		if(uart_read_nonblock()) {
@@ -143,18 +227,28 @@ static int check_ack(void)
 static uint32_t get_uint32(unsigned char* data)
 {
 	return ((uint32_t) data[0] << 24) |
-		   ((uint32_t) data[1] << 16) |
-		   ((uint32_t) data[2] << 8) |
-			(uint32_t) data[3];
+			 ((uint32_t) data[1] << 16) |
+			 ((uint32_t) data[2] << 8) |
+			  (uint32_t) data[3];
 }
 
-#define MAX_FAILED 5
+#define MAX_FAILURES 256
+
+static int serialboot_fail(int *failures)
+{
+	(*failures)++;
+	if(*failures >= MAX_FAILURES) {
+		printf("Too many consecutive errors, aborting\n");
+		return 1;
+	}
+	return 0;
+}
 
 /* Returns 1 if other boot methods should be tried */
 int serialboot(void)
 {
 	struct sfl_frame frame;
-	int failed;
+	int failures;
 	static const char str[SFL_MAGIC_LEN+1] = SFL_MAGIC_REQ;
 	const char *c;
 	int ack_status;
@@ -162,7 +256,7 @@ int serialboot(void)
 	printf("Booting from serial...\n");
 	printf("Press Q or ESC to abort boot completely.\n");
 
-	/* Send the serialboot "magic" request to Host */
+	/* Send the serialboot "magic" request to Host and wait for ACK_OK */
 	c = str;
 	while(*c) {
 		uart_write(*c);
@@ -177,76 +271,356 @@ int serialboot(void)
 		printf("Cancelled\n");
 		return 0;
 	}
-	/* Assume ACK_OK */
 
-	failed = 0;
+	/* Assume ACK_OK */
+	failures = 0;
 	while(1) {
 		int i;
-		int actualcrc;
-		int goodcrc;
+		int timeout;
+		int computed_crc;
+		int received_crc;
 
 		/* Get one Frame */
-		frame.payload_length = uart_read();
-		frame.crc[0] = uart_read();
-		frame.crc[1] = uart_read();
-		frame.cmd = uart_read();
-		for(i=0;i<frame.payload_length;i++)
-			frame.payload[i] = uart_read();
-
-		/* Check Frame CRC (if CMD has a CRC) */
-		actualcrc = ((int)frame.crc[0] << 8)|(int)frame.crc[1];
-		goodcrc = crc16(&frame.cmd, frame.payload_length+1);
-		if(actualcrc != goodcrc) {
-			/* Clear out the RX buffer */
-			while (uart_read_nonblock()) uart_read();
-			failed++;
-			if(failed == MAX_FAILED) {
-				printf("Too many consecutive errors, aborting");
-				return 1;
+		i = 0;
+		timeout = 1;
+		timer0_load(CMD_TIMEOUT_DELAY);
+		while(timer0_value_read()) {
+			if (uart_read_nonblock()) {
+				unsigned char data;
+				data = uart_read();
+				/* Reload the inter-byte timeout: a full frame can take longer
+				   than CMD_TIMEOUT_DELAY at low baudrates. */
+				timer0_load(CMD_TIMEOUT_DELAY);
+				if (i == 0)
+					frame.payload_length = data;
+				if (i == 1) frame.crc[0] = data;
+				if (i == 2) frame.crc[1] = data;
+				if (i == 3) frame.cmd    = data;
+				if (i >= 4) {
+					frame.payload[i-4] = data;
+				}
+				if (i == (frame.payload_length + 4 - 1)) {
+					timeout = 0;
+					break;
+				}
+				i++;
 			}
+			timer0_update_value_write(1);
+		}
+
+		/* Check Timeout */
+		if (timeout) {
+			/* Acknowledge the Timeout and continue with a new frame */
+			uart_write(SFL_ACK_ERROR);
+			if(serialboot_fail(&failures))
+				return 1;
+			continue;
+		}
+
+		/* Check Frame CRC */
+		received_crc = ((int)frame.crc[0] << 8)|(int)frame.crc[1];
+		computed_crc = crc16(&frame.cmd, frame.payload_length + 1);
+		if(computed_crc != received_crc) {
+			/* Acknowledge the CRC error */
 			uart_write(SFL_ACK_CRCERROR);
+
+			/* Increment failures and exit when max is reached */
+			if(serialboot_fail(&failures))
+				return 1;
 			continue;
 		}
 
 		/* Execute Frame CMD */
 		switch(frame.cmd) {
+			/* On SFL_CMD_ABORT ... */
 			case SFL_CMD_ABORT:
-				failed = 0;
+				/* Reset failures */
+				failures = 0;
+				/* Acknowledge and exit */
 				uart_write(SFL_ACK_SUCCESS);
 				return 1;
-			case SFL_CMD_LOAD: {
-				char *writepointer;
 
-				failed = 0;
-				writepointer = (char *)(uintptr_t) get_uint32(&frame.payload[0]);
-				for(i=4;i<frame.payload_length;i++)
-					*(writepointer++) = frame.payload[i];
-				if (frame.cmd == SFL_CMD_LOAD)
-					uart_write(SFL_ACK_SUCCESS);
+			/* On SFL_CMD_LOAD... */
+			case SFL_CMD_LOAD: {
+				char *load_addr;
+				uint32_t load_size;
+				size_t max_size;
+
+				if(frame.payload_length < 4) {
+					uart_write(SFL_ACK_ERROR);
+					if(serialboot_fail(&failures))
+						return 1;
+					break;
+				}
+
+				/* Copy payload when it fits in writable memory */
+				load_addr = (char *)(uintptr_t) get_uint32(&frame.payload[0]);
+				load_size = frame.payload_length - 4;
+				if (!boot_load_max_size((unsigned long)load_addr, &max_size) ||
+				    (load_size > max_size)) {
+					uart_write(SFL_ACK_ERROR);
+					if(serialboot_fail(&failures))
+						return 1;
+					break;
+				}
+				memcpy(load_addr, &frame.payload[4], load_size);
+
+#ifdef HAS_CLEAN_CPU_DCACHE_RANGE
+				if(load_size != 0)
+					clean_cpu_dcache_range(load_addr, load_size);
+#endif
+
+				/* Only a successful load ends a run of consecutive errors. */
+				failures = 0;
+				/* Acknowledge and continue */
+				uart_write(SFL_ACK_SUCCESS);
 				break;
 			}
+			/* On SFL_CMD_JUMP ... */
 			case SFL_CMD_JUMP: {
-				uint32_t addr;
+				uint32_t jump_addr;
 
-				failed = 0;
-				addr = get_uint32(&frame.payload[0]);
+				if(frame.payload_length < 4) {
+					uart_write(SFL_ACK_ERROR);
+					if(serialboot_fail(&failures))
+						return 1;
+					break;
+				}
+
+				/* Reset failures */
+				failures = 0;
+
+				/* Acknowledge and jump */
 				uart_write(SFL_ACK_SUCCESS);
-				boot(0, 0, 0, addr);
+				jump_addr = get_uint32(&frame.payload[0]);
+				boot(0, 0, 0, jump_addr);
 				break;
 			}
 			default:
-				failed++;
-				if(failed == MAX_FAILED) {
-					printf("Too many consecutive errors, aborting");
-					return 1;
-				}
+				/* Acknowledge the UNKNOWN cmd */
 				uart_write(SFL_ACK_UNKNOWN);
+
+				/* Increment failures and exit when max is reached */
+				if(serialboot_fail(&failures))
+					return 1;
+
 				break;
 		}
 	}
 	return 1;
 }
 
+#endif
+
+#if defined(CSR_ETHMAC_BASE) || defined(CSR_SPISDCARD_BASE) || defined(CSR_SDCARD_BASE) || defined(CSR_SATA_SECTOR2MEM_BASE)
+static int json_token_to_string(char *dst, size_t dst_size, const char *json, jsmntok_t *token)
+{
+	int len;
+
+	if ((token->start < 0) || (token->end < token->start))
+		return 0;
+	len = token->end - token->start;
+	if (len >= (int)dst_size)
+		return 0;
+	memcpy(dst, json + token->start, len);
+	dst[len] = 0;
+	return 1;
+}
+
+static int boot_parse_address(const char *value, unsigned long *address)
+{
+	if (!parse_ulong(value, address)) {
+		printf("Error: invalid boot address \"%s\"\n", value);
+		return 0;
+	}
+	return 1;
+}
+
+/* Keep the JSON buffer static to limit stack pressure in the boot paths. This
+ * is especially useful on 64-bit CPUs or when FatFs also needs temporary stack
+ * storage while reading boot.json.
+ */
+#define BOOT_JSON_BUFFER_SIZE 1024
+
+static char boot_json_buffer[BOOT_JSON_BUFFER_SIZE];
+
+typedef int (*boot_json_load_cb)(void *opaque, const char *filename,
+	unsigned long load_addr, size_t max_size);
+
+static int boot_json_key_is(const char *json, const jsmntok_t *key, const char *name)
+{
+	return key->end - key->start == (int)strlen(name) &&
+		!strncmp(json + key->start, name, key->end - key->start);
+}
+
+static int boot_json_is_image(const char *json, const jsmntok_t *key)
+{
+	return !boot_json_key_is(json, key, "bootargs") &&
+		!boot_json_key_is(json, key, "addr") &&
+		!boot_json_key_is(json, key, "r1") &&
+		!boot_json_key_is(json, key, "r2") &&
+		!boot_json_key_is(json, key, "r3");
+}
+
+/* Flatten the optional bootargs object in place, preserving the image order.
+   The remaining passes can then validate both nested and top-level metadata
+   without another token array or special cases in the image loader. */
+static int boot_json_flatten(const char *json, jsmntok_t *t, int count)
+{
+	int bootargs_found = 0;
+
+	if (count < 1 || t[0].type != JSMN_OBJECT)
+		return 0;
+	for (int i = 1; i + 1 < count; i += 2) {
+		if (t[i+1].end >= t[0].end)
+			return 0;
+		if (boot_json_key_is(json, &t[i], "bootargs")) {
+			if (bootargs_found++)
+				return 0;
+			if (t[i].type != JSMN_STRING || t[i].size != 1)
+				return 0;
+			if (t[i+1].type == JSMN_OBJECT) {
+				int next = i + 2 + 2*t[i+1].size;
+
+				if (next > count)
+					return 0;
+				for (int j = i + 2; j < next; j += 2) {
+					if (boot_json_is_image(json, &t[j]) ||
+					    boot_json_key_is(json, &t[j], "bootargs") ||
+					    (t[j+1].type != JSMN_STRING && t[j+1].type != JSMN_PRIMITIVE) ||
+					    t[j+1].end >= t[i+1].end)
+						return 0;
+				}
+				if (next < count && t[next].start < t[i+1].end)
+					return 0;
+				t[0].size += t[i+1].size - 1;
+				memmove(&t[i], &t[i+2], (count - i - 2)*sizeof(*t));
+				count -= 2;
+				i -= 2;
+				continue;
+			}
+		}
+		if (t[i+1].type != JSMN_STRING && t[i+1].type != JSMN_PRIMITIVE)
+			return 0;
+	}
+	return count == 1 + 2*t[0].size ? count : 0;
+}
+
+static void boot_from_json_buffer(const char *json_buffer, int size,
+	boot_json_load_cb load_cb, void *opaque)
+{
+	char json_name[256];
+	char json_value[64];
+	unsigned long boot_r1 = 0, boot_r2 = 0, boot_r3 = 0, boot_addr = 0;
+	int image_found = 0, boot_addr_found = 0;
+	static jsmntok_t t[64];
+	jsmn_parser p;
+	int count;
+
+	jsmn_init(&p);
+	count = jsmn_parse(&p, json_buffer, size, t, sizeof(t)/sizeof(*t));
+	if (count < 0) {
+		printf("Error: failed to parse boot JSON (%d; max %d tokens)\n",
+			count, (int)(sizeof(t)/sizeof(*t)));
+		return;
+	}
+	count = boot_json_flatten(json_buffer, t, count);
+	if (!count) {
+		printf("Error: invalid boot JSON structure\n");
+		return;
+	}
+
+	/* Validate the complete manifest before writing any image. */
+	for (int i = 1; i < count; i += 2) {
+		unsigned long value;
+		size_t max_size;
+
+		if (t[i].type != JSMN_STRING || t[i].size != 1 ||
+		    (t[i+1].type != JSMN_STRING && t[i+1].type != JSMN_PRIMITIVE) ||
+		    !json_token_to_string(json_name, sizeof(json_name), json_buffer, &t[i])) {
+			printf("Error: invalid boot JSON entry\n");
+			return;
+		}
+		for (int j = 1; j < i; j += 2) {
+			if (boot_json_key_is(json_buffer, &t[j], json_name)) {
+				printf("Error: duplicate boot JSON key \"%s\"\n", json_name);
+				return;
+			}
+		}
+		/* Preserve legacy ignored scalar bootargs without copying its value.
+		   Object bootargs have already been flattened into metadata entries. */
+		if (boot_json_key_is(json_buffer, &t[i], "bootargs"))
+			continue;
+		if (!json_token_to_string(json_value, sizeof(json_value), json_buffer, &t[i+1]) ||
+		    !boot_parse_address(json_value, &value))
+			return;
+		if (!strcmp(json_name, "addr")) {
+			boot_addr = value;
+			boot_addr_found = 1;
+		} else if (!strcmp(json_name, "r1")) {
+			boot_r1 = value;
+		} else if (!strcmp(json_name, "r2")) {
+			boot_r2 = value;
+		} else if (!strcmp(json_name, "r3")) {
+			boot_r3 = value;
+		} else {
+			if (!boot_load_max_size(value, &max_size))
+				return;
+			for (int j = 1; j < i; j += 2) {
+				unsigned long other;
+
+				if (!boot_json_is_image(json_buffer, &t[j]))
+					continue;
+				json_token_to_string(json_value, sizeof(json_value), json_buffer, &t[j+1]);
+				if (!boot_parse_address(json_value, &other))
+					return;
+				if (boot_physical_address(other) == boot_physical_address(value)) {
+					printf("Error: boot images share load address 0x%08lx\n", value);
+					return;
+				}
+			}
+			image_found = 1;
+			if (!boot_addr_found)
+				boot_addr = value;
+		}
+	}
+	if (!image_found) {
+		printf("Error: no boot image found in boot JSON\n");
+		return;
+	}
+
+	/* Bound every image by the next destination, regardless of file order.
+	   Reusing the parsed tokens avoids an additional SRAM image table. */
+	for (int i = 1; i < count; i += 2) {
+		unsigned long load_addr, physical;
+		size_t max_size;
+
+		if (!boot_json_is_image(json_buffer, &t[i]))
+			continue;
+		json_token_to_string(json_name, sizeof(json_name), json_buffer, &t[i]);
+		json_token_to_string(json_value, sizeof(json_value), json_buffer, &t[i+1]);
+		if (!boot_parse_address(json_value, &load_addr))
+			return;
+		physical = boot_physical_address(load_addr);
+		if (!boot_load_max_size(load_addr, &max_size))
+			return;
+		for (int j = 1; j < count; j += 2) {
+			unsigned long other;
+
+			if (j == i || !boot_json_is_image(json_buffer, &t[j]))
+				continue;
+			json_token_to_string(json_value, sizeof(json_value), json_buffer, &t[j+1]);
+			if (!boot_parse_address(json_value, &other))
+				return;
+			other = boot_physical_address(other);
+			if (other > physical && max_size > other - physical)
+				max_size = other - physical;
+		}
+		if (!load_cb(opaque, json_name, load_addr, max_size))
+			return;
+	}
+	boot(boot_r1, boot_r2, boot_r3, boot_addr);
+}
 #endif
 
 /*-----------------------------------------------------------------------*/
@@ -259,7 +633,11 @@ int serialboot(void)
 #define TFTP_SERVER_PORT 69
 #endif
 
+#ifdef MACADDR1
+static unsigned char macadr[6] = {MACADDR1, MACADDR2, MACADDR3, MACADDR4, MACADDR5, MACADDR6};
+#else
 static unsigned char macadr[6] = {0x10, 0xe2, 0xd5, 0x00, 0x00, 0x00};
+#endif
 
 #ifdef LOCALIP1
 static unsigned int local_ip[4] = {LOCALIP1, LOCALIP2, LOCALIP3, LOCALIP4};
@@ -274,60 +652,76 @@ static unsigned int remote_ip[4] = {192, 168, 1, 100};
 #endif
 
 static int copy_file_from_tftp_to_ram(unsigned int ip, unsigned short server_port,
-const char *filename, char *buffer)
+const char *filename, char *buffer, size_t max_size)
 {
 	int size;
 	printf("Copying %s to %p... ", filename, buffer);
-	size = tftp_get(ip, server_port, filename, buffer);
+	size = tftp_get(ip, server_port, filename, buffer, max_size);
 	if(size > 0)
 		printf("(%d bytes)", size);
 	printf("\n");
 	return size;
 }
 
+struct netboot_json_ctx {
+	unsigned int ip;
+	unsigned short tftp_port;
+};
+
+static int netboot_json_load(void *opaque, const char *filename,
+	unsigned long load_addr, size_t max_size)
+{
+	struct netboot_json_ctx *ctx = opaque;
+
+	/* Copy Image from Network to address */
+	return copy_file_from_tftp_to_ram(ctx->ip, ctx->tftp_port, filename,
+		(void *)load_addr, max_size) > 0;
+}
+
 #ifdef ETH_DYNAMIC_IP
 
-static uint8_t parse_ip(const char * ip_address, unsigned int * ip_to_change)
+int parse_ip(const char *ip_address, unsigned int *ip_to_change)
 {
-	uint8_t n = 0;
-	uint8_t k = 0;
-	uint8_t i;
-	uint8_t size = strlen(ip_address);
 	unsigned int ip_to_set[4];
-	char buf[3];
-
-	if (size < 7 || size > 15) {
-		printf("Error: Invalid IP address length.");
-		return -1;
-	}
+	const char *p = ip_address;
+	char *end;
 
 	/* Extract numbers from input, check for potential errors */
-	for (i = 0; i < size; i++) {
-		if ((ip_address[i] == '.' && k != 0) || (ip_address[i] == '\n' && i == size - 1)) {
-			ip_to_set[n] = atoi(buf);
-			n++;
-			k = 0;
-			memset(buf, '\0', sizeof(buf));
-		} else if (ip_address[i] >= '0' && ip_address[i] <= '9' && k < 3) {
-			buf[k] = ip_address[i];
-			k++;
-		} else {
-			printf("Error: Invalid IP address format. Correct format is \"X.X.X.X\".");
+	for (int i = 0; i < 4; i++) {
+		unsigned long octet;
+
+		if ((*p < '0') || (*p > '9')) {
+			printf("Error: invalid IP address format; expected X.X.X.X\n");
 			return -1;
 		}
-	}
-	ip_to_set[n] = atoi(buf);
 
-	/* Check if a correct number of numbers was extracted from the input*/
-	if (n != 3) {
-		printf("Error: Invalid IP address format. Correct format is \"X.X.X.X\".");
-		return -1;
+		octet = strtoul(p, &end, 10);
+		if ((end == p) || (octet > 255)) {
+			printf("Error: invalid IP address octet\n");
+			return -1;
+		}
+		ip_to_set[i] = octet;
+
+		if (i == 3) {
+			while ((*end == '\r') || (*end == '\n'))
+				end++;
+			if (*end != 0) {
+				printf("Error: invalid IP address format; expected X.X.X.X\n");
+				return -1;
+			}
+		} else {
+			if (*end != '.') {
+				printf("Error: invalid IP address format; expected X.X.X.X\n");
+				return -1;
+			}
+			p = end + 1;
+		}
 	}
 
 	/* Set the extracted IP address as local or remote ip */
-	for (i = 0; i <= n; i++) {
+	for (int i = 0; i < 4; i++)
 		ip_to_change[i] = ip_to_set[i];
-	}
+
 	return 0;
 }
 
@@ -335,60 +729,56 @@ void set_local_ip(const char * ip_address)
 {
 	if (parse_ip(ip_address, local_ip) == 0) {
 		udp_set_ip(IPTOINT(local_ip[0], local_ip[1], local_ip[2], local_ip[3]));
-		printf("Local IP: %d.%d.%d.%d", local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
+		printf("Local IP: %d.%d.%d.%d\n", local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
+		net_init();
 	}
 }
 
 void set_remote_ip(const char * ip_address)
 {
 	if (parse_ip(ip_address, remote_ip) == 0) {
-		printf("Remote IP: %d.%d.%d.%d", remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
+		printf("Remote IP: %d.%d.%d.%d\n", remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
 	}
 }
 
-static uint8_t parse_mac_addr(const char * mac_address)
+static int parse_mac_addr(const char *mac_address)
 {
-	uint8_t n = 0;
-	uint8_t k = 0;
-	uint8_t i;
-	uint8_t size = strlen(mac_address);
-	unsigned int mac_to_set[6];
-	char buf[2];
+	unsigned char mac_to_set[6];
+	size_t size = strlen(mac_address);
+	char buf[3] = {0};
+
+	while ((size > 0) && ((mac_address[size - 1] == '\r') || (mac_address[size - 1] == '\n')))
+		size--;
 
 	if (size != 17) {
-		printf("Error: Invalid MAC address length.");
+		printf("Error: invalid MAC address length\n");
 		return -1;
 	}
 
 	/* Extract numbers from input, check for potential errors */
-	for (i = 0; i < size; i++) {
-		if ((mac_address[i] == ':' && k != 0) || (mac_address[i] == '\n' && i == size - 1)) {
-			mac_to_set[n] = strtol(buf, NULL, 16);
-			n++;
-			k = 0;
-			memset(buf, '\0', sizeof(buf));
-		} else if (((mac_address[i] >= '0' && mac_address[i] <= '9') ||
-			(mac_address[i] >= 'a' && mac_address[i] <= 'f') ||
-			(mac_address[i] >= 'A' && mac_address[i] <= 'F')) && k < 2) {
-			buf[k] = mac_address[i];
-			k++;
-		} else {
-			printf("Error: Invalid MAC address format. Correct format is \"XX:XX:XX:XX:XX:XX\".");
+	for (int i = 0; i < 6; i++) {
+		const char *group = &mac_address[3*i];
+
+		if (!(((group[0] >= '0') && (group[0] <= '9')) ||
+		      ((group[0] >= 'a') && (group[0] <= 'f')) ||
+		      ((group[0] >= 'A') && (group[0] <= 'F'))) ||
+		    !(((group[1] >= '0') && (group[1] <= '9')) ||
+		      ((group[1] >= 'a') && (group[1] <= 'f')) ||
+		      ((group[1] >= 'A') && (group[1] <= 'F'))) ||
+		    ((i < 5) && (group[2] != ':'))) {
+			printf("Error: invalid MAC address format; expected XX:XX:XX:XX:XX:XX\n");
 			return -1;
 		}
-	}
-	mac_to_set[n] = strtol(buf, NULL, 16);
 
-	/* Check if correct number of numbers was extracted from input */
-	if (n != 5) {
-		printf("Error: Invalid MAC address format. Correct format is \"XX:XX:XX:XX:XX:XX\".");
-		return -1;
+		buf[0] = group[0];
+		buf[1] = group[1];
+		mac_to_set[i] = strtoul(buf, NULL, 16);
 	}
 
 	/* Set the extracted MAC address as macadr */
-	for (i = 0; i <= n; i++) {
+	for (int i = 0; i < 6; i++)
 		macadr[i] = mac_to_set[i];
-	}
+
 	return 0;
 }
 
@@ -396,116 +786,100 @@ void set_mac_addr(const char * mac_address)
 {
 	if (parse_mac_addr(mac_address) == 0) {
 		udp_set_mac(macadr);
-		printf("MAC address : %x:%x:%x:%x:%x:%x", macadr[0], macadr[1], macadr[2], macadr[3], macadr[4], macadr[5]);
+		printf("MAC address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+			macadr[0], macadr[1], macadr[2], macadr[3], macadr[4], macadr[5]);
+		net_init();
 	}
 }
 
 #endif
 
+#ifdef ETH_WITH_DHCP
+void dhcp_get_ip(void)
+{
+	uint32_t ip;
+
+	if(dhcp_resolve(macadr, &ip) != 0) {
+		net_init();
+		return;
+	}
+
+	local_ip[0] = (ip >> 24) & 0xff;
+	local_ip[1] = (ip >> 16) & 0xff;
+	local_ip[2] = (ip >>  8) & 0xff;
+	local_ip[3] = (ip >>  0) & 0xff;
+	net_init();
+}
+#endif
+
 static void netboot_from_json(const char * filename, unsigned int ip, unsigned short tftp_port)
 {
 	int size;
-	uint8_t i;
-	uint8_t count;
-
-	/* FIXME: modify/increase if too limiting */
-	char json_buffer[1024];
-	char json_name[32];
-	char json_value[32];
-
-	unsigned long boot_r1 = 0;
-	unsigned long boot_r2 = 0;
-	unsigned long boot_r3 = 0;
-	unsigned long boot_addr = 0;
-
-	uint8_t image_found = 0;
-	uint8_t boot_addr_found = 0;
+	struct netboot_json_ctx ctx;
 
 	/* Read JSON file */
-	size = tftp_get(ip, tftp_port, filename, json_buffer);
+	size = tftp_get(ip, tftp_port, filename,
+		boot_json_buffer, sizeof(boot_json_buffer) - 1);
 	if (size <= 0)
 		return;
+	boot_json_buffer[size] = 0;
 
 	/* Parse JSON file */
-	jsmntok_t t[32];
-	jsmn_parser p;
-	jsmn_init(&p);
-	count = jsmn_parse(&p, json_buffer, strlen(json_buffer), t, sizeof(t)/sizeof(*t));
-	for (i=0; i<count-1; i++) {
-		memset(json_name,   0, sizeof(json_name));
-		memset(json_value,  0, sizeof(json_value));
-		/* Elements are JSON strings with 1 children */
-		if ((t[i].type == JSMN_STRING) && (t[i].size == 1)) {
-			/* Get Element's filename */
-			memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-			/* Get Element's address */
-			memcpy(json_value, json_buffer + t[i+1].start, t[i+1].end - t[i+1].start);
-			/* Skip bootargs (optional) */
-			if (strncmp(json_name, "bootargs", 8) == 0) {
-				continue;
-			}
-			/* Get boot addr (optional) */
-			else if (strncmp(json_name, "addr", 4) == 0) {
-				boot_addr = strtoul(json_value, NULL, 0);
-				boot_addr_found = 1;
-			}
-			/* Get boot r1 (optional) */
-			else if (strncmp(json_name, "r1", 2) == 0) {
-				memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-				boot_r1 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r2 (optional) */
-			else if (strncmp(json_name, "r2", 2) == 0) {
-				boot_r2 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r3 (optional) */
-			else if (strncmp(json_name, "r3", 2) == 0) {
-				boot_r3 = strtoul(json_value, NULL, 0);
-			/* Copy Image from Network to address */
-			} else {
-				size = copy_file_from_tftp_to_ram(ip, tftp_port, json_name, (void *)strtoul(json_value, NULL, 0));
-				if (size <= 0)
-					return;
-				image_found = 1;
-				if (boot_addr_found == 0) /* Boot to last Image address if no bootargs.addr specified */
-					boot_addr = strtoul(json_value, NULL, 0);
-			}
-		}
-	}
-
-	/* Boot */
-	if (image_found)
-		boot(boot_r1, boot_r2, boot_r3, boot_addr);
+	ctx.ip = ip;
+	ctx.tftp_port = tftp_port;
+	boot_from_json_buffer(boot_json_buffer, size, netboot_json_load, &ctx);
 }
 
+#ifdef MAIN_RAM_BASE_VA
 static void netboot_from_bin(const char * filename, unsigned int ip, unsigned short tftp_port)
 {
 	int size;
-	size = copy_file_from_tftp_to_ram(ip, tftp_port, filename, (void *)MAIN_RAM_BASE);
+	size_t max_size;
+	if (!boot_load_max_size(MAIN_RAM_BASE_VA, &max_size))
+		return;
+	size = copy_file_from_tftp_to_ram(ip, tftp_port, filename, (void *)MAIN_RAM_BASE_VA, max_size);
 	if (size <= 0)
 		return;
-	boot(0, 0, 0, MAIN_RAM_BASE);
+	boot(0, 0, 0, MAIN_RAM_BASE_VA);
+}
+#endif
+
+void net_init(void) {
+	printf("Local IP: %d.%d.%d.%d\n", local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
+	udp_start(macadr, IPTOINT(local_ip[0], local_ip[1], local_ip[2], local_ip[3]));
 }
 
-void netboot(void)
+void netboot(int nb_params, char **params)
 {
 	unsigned int ip;
+	char * filename = NULL;
+
+	if (nb_params > 0 )
+		filename = params[0];
 
 	printf("Booting from network...\n");
 
-	printf("Local IP: %d.%d.%d.%d\n", local_ip[0], local_ip[1], local_ip[2], local_ip[3]);
+	net_init();
 	printf("Remote IP: %d.%d.%d.%d\n", remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
 
 	ip = IPTOINT(remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3]);
-	udp_start(macadr, IPTOINT(local_ip[0], local_ip[1], local_ip[2], local_ip[3]));
 
-	/* Boot from boot.json */
-	printf("Booting from boot.json...\n");
-	netboot_from_json("boot.json", ip, TFTP_SERVER_PORT);
+	if (filename) {
+		printf("Booting from %s (JSON)...\n", filename);
+		netboot_from_json(filename, ip, TFTP_SERVER_PORT);
+	} else {
+#ifndef ETH_NETBOOT_SKIP_JSON
+		/* Boot from boot.json */
+		printf("Booting from boot.json...\n");
+		netboot_from_json("boot.json", ip, TFTP_SERVER_PORT);
+#endif /* ETH_NETBOOT_SKIP_JSON */
 
-	/* Boot from boot.bin */
-	printf("Booting from boot.bin...\n");
-	netboot_from_bin("boot.bin", ip, TFTP_SERVER_PORT);
+#ifdef MAIN_RAM_BASE_VA
+		/* Boot from boot.bin */
+		printf("Booting from boot.bin...\n");
+		netboot_from_bin("boot.bin", ip, TFTP_SERVER_PORT);
+#endif
+	}
 
 	/* Boot failed if we are here... */
 	printf("Network boot failed.\n");
@@ -519,37 +893,85 @@ void netboot(void)
 
 #ifdef FLASH_BOOT_ADDRESS
 
-static unsigned int check_image_in_flash(unsigned int base_address)
+/* Sanity limit on the flash image length field (catches erased/garbage
+   flash). Defaults to the Main RAM size when available since the image has to
+   fit there anyway; override with FLASH_BOOT_MAX_SIZE if needed. */
+#ifndef FLASH_BOOT_MAX_SIZE
+#ifdef MAIN_RAM_SIZE
+#define FLASH_BOOT_MAX_SIZE MAIN_RAM_SIZE
+#else
+#define FLASH_BOOT_MAX_SIZE (16*1024*1024)
+#endif
+#endif
+
+/* Targets with another flash mapping can describe its bounds explicitly. */
+#if defined(FLASH_BOOT_REGION_BASE) != defined(FLASH_BOOT_REGION_SIZE)
+#error "FLASH_BOOT_REGION_BASE and FLASH_BOOT_REGION_SIZE must be specified together"
+#endif
+#if !defined(FLASH_BOOT_REGION_BASE) && defined(SPIFLASH_BASE)
+#define FLASH_BOOT_REGION_BASE SPIFLASH_BASE
+#define FLASH_BOOT_REGION_SIZE SPIFLASH_SIZE
+#endif
+
+static unsigned int check_image_in_flash(unsigned long base_address)
 {
 	uint32_t length;
 	uint32_t crc;
 	uint32_t got_crc;
+#ifdef FLASH_BOOT_REGION_BASE
+	size_t available;
+
+	if (!boot_region_max_size(base_address, FLASH_BOOT_REGION_BASE,
+		FLASH_BOOT_REGION_SIZE, &available) || available < 8) {
+		printf("Error: flash image header is outside flash\n");
+		return 0;
+	}
+#endif
 
 	length = MMPTR(base_address);
-	if((length < 32) || (length > 16*1024*1024)) {
-		printf("Error: Invalid image length 0x%08x\n", length);
+	if((length < 32) || (length > FLASH_BOOT_MAX_SIZE)) {
+		printf("Error: invalid image length 0x%08lx\n", (unsigned long)length);
+		return 0;
+	}
+	/* Validate the source before CRC reads any payload bytes. The image
+	   policy limit alone need not fit the remaining flash mapping. */
+	if (base_address > ULONG_MAX - 8 || length - 1 > ULONG_MAX - base_address - 8
+#ifdef FLASH_BOOT_REGION_BASE
+		|| length > available - 8
+#endif
+	) {
+		printf("Error: flash image extends beyond flash or the address space\n");
 		return 0;
 	}
 
 	crc = MMPTR(base_address + 4);
 	got_crc = crc32((unsigned char *)(base_address + 8), length);
 	if(crc != got_crc) {
-		printf("CRC failed (expected %08x, got %08x)\n", crc, got_crc);
+		printf("CRC failed (expected %08lx, got %08lx)\n", (unsigned long)crc, (unsigned long)got_crc);
 		return 0;
 	}
 
 	return length;
 }
 
-#if defined(MAIN_RAM_BASE) && defined(FLASH_BOOT_ADDRESS)
-static int copy_image_from_flash_to_ram(unsigned int flash_address, unsigned long ram_address)
+#if defined(MAIN_RAM_BASE_VA) && defined(FLASH_BOOT_ADDRESS)
+static int copy_image_from_flash_to_ram(unsigned long flash_address, unsigned long ram_address)
 {
 	uint32_t length;
 	uint32_t offset;
 
 	length = check_image_in_flash(flash_address);
 	if(length > 0) {
-		printf("Copying 0x%08x to 0x%08lx (%d bytes)...\n", flash_address, ram_address, length);
+		size_t max_size;
+
+		if (!boot_load_max_size(ram_address, &max_size))
+			return 0;
+		if (length > max_size) {
+			printf("Error: image is too large for destination (0x%08lx > 0x%08lx bytes)\n",
+				(unsigned long)length, (unsigned long)max_size);
+			return 0;
+		}
+		printf("Copying 0x%08lx to 0x%08lx (%lu bytes)...\n", flash_address, ram_address, (unsigned long)length);
 		offset = 0;
 		init_progression_bar(length);
 		while (length > 0) {
@@ -571,22 +993,18 @@ static int copy_image_from_flash_to_ram(unsigned int flash_address, unsigned lon
 
 void flashboot(void)
 {
-	uint32_t length;
-	uint32_t result;
-
 	printf("Booting from flash...\n");
-	length = check_image_in_flash(FLASH_BOOT_ADDRESS);
-	if(!length)
-		return;
 
-#ifdef MAIN_RAM_BASE
+#ifdef MAIN_RAM_BASE_VA
 	/* When Main RAM is available, copy the code from the Flash and execute it
-	from Main RAM since faster */
-	result = copy_image_from_flash_to_ram(FLASH_BOOT_ADDRESS, MAIN_RAM_BASE);
-	if(!result)
+	from Main RAM since faster. The image is checked as part of the copy, no
+	need to check it twice (the CRC over flash is slow). */
+	if(!copy_image_from_flash_to_ram(FLASH_BOOT_ADDRESS, MAIN_RAM_BASE_VA))
 		return;
-	boot(0, 0, 0, MAIN_RAM_BASE);
+	boot(0, 0, 0, MAIN_RAM_BASE_VA);
 #else
+	if(!check_image_in_flash(FLASH_BOOT_ADDRESS))
+		return;
 	/* When Main RAM is not available, execute the code directly from Flash (XIP).
        The code starts after (a) length and (b) CRC -- both uint32_t */
 	boot(0, 0, 0, (FLASH_BOOT_ADDRESS + 2 * sizeof(uint32_t)));
@@ -599,343 +1017,143 @@ void flashboot(void)
 /* SDCard Boot                                                           */
 /*-----------------------------------------------------------------------*/
 
-#if defined(CSR_SPISDCARD_BASE) || defined(CSR_SDCORE_BASE)
+#if defined(CSR_SPISDCARD_BASE) || defined(CSR_SDCARD_BASE) || defined(CSR_SATA_SECTOR2MEM_BASE)
 
-static int copy_file_from_sdcard_to_ram(const char * filename, unsigned long ram_address)
+/* The selected FatFs disk operations determine the boot medium. Keep file
+ * validation and cleanup common to SDCard and SATA, including boot.json. */
+static enum boot_load_result fatfs_load_file(const char *filename, void *buffer,
+	size_t max_size, size_t *loaded_size, int progress)
 {
-	FRESULT fr;
 	FATFS fs;
 	FIL file;
-	uint32_t br;
-	uint32_t offset;
-	uint32_t length;
+	FRESULT fr;
+	enum boot_load_result result = BOOT_LOAD_IO_ERROR;
+	size_t length;
+	size_t offset = 0;
 
+	*loaded_size = 0;
 	fr = f_mount(&fs, "", 1);
-	if (fr != FR_OK)
-		return 0;
+	if (fr != FR_OK) {
+		printf("Error: filesystem mount failed (FatFs error %d)\n", fr);
+		/* FatFs registers the object even when the immediate mount fails. */
+		f_mount(0, "", 0);
+		return result;
+	}
 	fr = f_open(&file, filename, FA_READ);
 	if (fr != FR_OK) {
-		printf("%s file not found.\n", filename);
+		printf("Error: cannot open %s (FatFs error %d)\n", filename, fr);
 		f_mount(0, "", 0);
-		return 0;
+		return (fr == FR_NO_FILE || fr == FR_NO_PATH) ? BOOT_LOAD_NOT_FOUND : result;
 	}
 
+	if (f_size(&file) == 0 || f_size(&file) > max_size) {
+		printf("Error: %s is empty or too large for destination (max 0x%lx bytes)\n",
+			filename, (unsigned long)max_size);
+		result = BOOT_LOAD_INVALID;
+		goto close;
+	}
 	length = f_size(&file);
-	printf("Copying %s to 0x%08lx (%d bytes)...\n", filename, ram_address, length);
-	init_progression_bar(length);
-	offset = 0;
-	for (;;) {
-		fr = f_read(&file, (void*) ram_address + offset,  0x8000, &br);
-		if (fr != FR_OK) {
-			printf("file read error.\n");
-			f_close(&file);
-			f_mount(0, "", 0);
-			return 0;
+	if (progress) {
+		printf("Copying %s to %p (%lu bytes)...\n", filename, buffer, (unsigned long)length);
+		init_progression_bar(length);
+	}
+	while (offset < length) {
+		UINT br;
+		UINT chunk = length - offset > 0x8000 ? 0x8000 : length - offset;
+
+		fr = f_read(&file, (char *)buffer + offset, chunk, &br);
+		if (fr != FR_OK || br != chunk) {
+			printf("Error: incomplete read of %s at 0x%lx (FatFs error %d)\n",
+				filename, (unsigned long)offset, fr);
+			goto close;
 		}
-		if (br == 0)
-			break;
 		offset += br;
-		show_progress(offset);
+		if (progress)
+			show_progress(offset);
 	}
-	show_progress(offset);
-	printf("\n");
-
+	if (progress)
+		printf("\n");
+	*loaded_size = length;
+	result = BOOT_LOAD_OK;
+close:
 	f_close(&file);
 	f_mount(0, "", 0);
-
-	return 1;
+	return result;
 }
 
-static void sdcardboot_from_json(const char * filename)
+static int fatfsboot_json_load(void *opaque, const char *filename,
+	unsigned long load_addr, size_t max_size)
 {
-	FRESULT fr;
-	FATFS fs;
-	FIL file;
+	size_t size;
 
-	uint8_t i;
-	uint8_t count;
-	uint32_t length;
-	uint32_t result;
-
-	/* FIXME: modify/increase if too limiting */
-	char json_buffer[1024];
-	char json_name[32];
-	char json_value[32];
-
-	unsigned long boot_r1 = 0;
-	unsigned long boot_r2 = 0;
-	unsigned long boot_r3 = 0;
-	unsigned long boot_addr = 0;
-
-	uint8_t image_found = 0;
-	uint8_t boot_addr_found = 0;
-
-	/* Read JSON file */
-	fr = f_mount(&fs, "", 1);
-	if (fr != FR_OK)
-		return;
-	fr = f_open(&file, filename, FA_READ);
-	if (fr != FR_OK) {
-		printf("%s file not found.\n", filename);
-		f_mount(0, "", 0);
-		return;
-	}
-
-	fr = f_read(&file, json_buffer, sizeof(json_buffer), &length);
-
-	/* Close JSON file */
-	f_close(&file);
-	f_mount(0, "", 0);
-
-	/* Parse JSON file */
-	jsmntok_t t[32];
-	jsmn_parser p;
-	jsmn_init(&p);
-	count = jsmn_parse(&p, json_buffer, strlen(json_buffer), t, sizeof(t)/sizeof(*t));
-	for (i=0; i<count-1; i++) {
-		memset(json_name,   0, sizeof(json_name));
-		memset(json_value,  0, sizeof(json_value));
-		/* Elements are JSON strings with 1 children */
-		if ((t[i].type == JSMN_STRING) && (t[i].size == 1)) {
-			/* Get Element's filename */
-			memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-			/* Get Element's address */
-			memcpy(json_value, json_buffer + t[i+1].start, t[i+1].end - t[i+1].start);
-			/* Skip bootargs (optional) */
-			if (strncmp(json_name, "bootargs", 8) == 0) {
-				continue;
-			}
-			/* Get boot addr (optional) */
-			else if (strncmp(json_name, "addr", 4) == 0) {
-				boot_addr = strtoul(json_value, NULL, 0);
-				boot_addr_found = 1;
-			}
-			/* Get boot r1 (optional) */
-			else if (strncmp(json_name, "r1", 2) == 0) {
-				memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-				boot_r1 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r2 (optional) */
-			else if (strncmp(json_name, "r2", 2) == 0) {
-				boot_r2 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r3 (optional) */
-			else if (strncmp(json_name, "r3", 2) == 0) {
-				boot_r3 = strtoul(json_value, NULL, 0);
-			/* Copy Image from SDCard to address */
-			} else {
-				result = copy_file_from_sdcard_to_ram(json_name, strtoul(json_value, NULL, 0));
-				if (result == 0)
-					return;
-				image_found = 1;
-				if (boot_addr_found == 0) /* Boot to last Image address if no bootargs.addr specified */
-					boot_addr = strtoul(json_value, NULL, 0);
-			}
-		}
-	}
-
-	/* Boot */
-	if (image_found)
-		boot(boot_r1, boot_r2, boot_r3, boot_addr);
+	(void)opaque;
+	return fatfs_load_file(filename, (void *)load_addr, max_size, &size, 1) == BOOT_LOAD_OK;
 }
 
-static void sdcardboot_from_bin(const char * filename)
+static void fatfsboot_from_json(const char *filename)
 {
-	uint32_t result;
-	result = copy_file_from_sdcard_to_ram(filename, MAIN_RAM_BASE);
-	if (result == 0)
+	size_t size;
+
+	if (fatfs_load_file(filename, boot_json_buffer, sizeof(boot_json_buffer) - 1,
+		&size, 0) != BOOT_LOAD_OK)
 		return;
-	boot(0, 0, 0, MAIN_RAM_BASE);
+	boot_json_buffer[size] = 0;
+	boot_from_json_buffer(boot_json_buffer, size, fatfsboot_json_load, NULL);
 }
 
-void sdcardboot(void)
+#ifdef MAIN_RAM_BASE_VA
+static void fatfsboot_from_bin(const char *filename)
+{
+	size_t size;
+	size_t max_size;
+
+	if (!boot_load_max_size(MAIN_RAM_BASE_VA, &max_size))
+		return;
+	if (fatfs_load_file(filename, (void *)MAIN_RAM_BASE_VA, max_size,
+		&size, 1) != BOOT_LOAD_OK)
+		return;
+	boot(0, 0, 0, MAIN_RAM_BASE_VA);
+}
+#endif
+
+static void fatfsboot(int nb_params, char **params)
+{
+	if (nb_params > 0) {
+		printf("Booting from %s (JSON)...\n", params[0]);
+		fatfsboot_from_json(params[0]);
+	} else {
+		printf("Booting from boot.json...\n");
+		fatfsboot_from_json("boot.json");
+#ifdef MAIN_RAM_BASE_VA
+		printf("Booting from boot.bin...\n");
+		fatfsboot_from_bin("boot.bin");
+#endif
+	}
+}
+#endif
+
+#if defined(CSR_SPISDCARD_BASE) || defined(CSR_SDCARD_BASE)
+void sdcardboot(int nb_params, char **params)
 {
 #ifdef CSR_SPISDCARD_BASE
 	printf("Booting from SDCard in SPI-Mode...\n");
+	fatfs_set_ops_spisdcard();
 #endif
-#ifdef CSR_SDCORE_BASE
+#ifdef CSR_SDCARD_BASE
 	printf("Booting from SDCard in SD-Mode...\n");
+	fatfs_set_ops_sdcard();
 #endif
-
-	/* Boot from boot.json */
-	printf("Booting from boot.json...\n");
-	sdcardboot_from_json("boot.json");
-
-	/* Boot from boot.bin */
-	printf("Booting from boot.bin...\n");
-	sdcardboot_from_bin("boot.bin");
-
-	/* Boot failed if we are here... */
+	fatfsboot(nb_params, params);
 	printf("SDCard boot failed.\n");
 }
 #endif
 
-/*-----------------------------------------------------------------------*/
-/* SATA Boot                                                             */
-/*-----------------------------------------------------------------------*/
-
-#if defined(CSR_SATA_SECTOR2MEM_BASE)
-
-static int copy_file_from_sata_to_ram(const char * filename, unsigned long ram_address)
-{
-	FRESULT fr;
-	FATFS fs;
-	FIL file;
-	uint32_t br;
-	uint32_t offset;
-	uint32_t length;
-
-	fr = f_mount(&fs, "", 1);
-	if (fr != FR_OK)
-		return 0;
-	fr = f_open(&file, filename, FA_READ);
-	if (fr != FR_OK) {
-		printf("%s file not found.\n", filename);
-		f_mount(0, "", 0);
-		return 0;
-	}
-
-	length = f_size(&file);
-	printf("Copying %s to 0x%08lx (%d bytes)...\n", filename, ram_address, length);
-	init_progression_bar(length);
-	offset = 0;
-	for (;;) {
-		fr = f_read(&file, (void*) ram_address + offset,  0x8000, &br);
-		if (fr != FR_OK) {
-			printf("file read error.\n");
-			f_close(&file);
-			f_mount(0, "", 0);
-			return 0;
-		}
-		if (br == 0)
-			break;
-		offset += br;
-		show_progress(offset);
-	}
-	show_progress(offset);
-	printf("\n");
-
-	f_close(&file);
-	f_mount(0, "", 0);
-
-	return 1;
-}
-
-static void sataboot_from_json(const char * filename)
-{
-	FRESULT fr;
-	FATFS fs;
-	FIL file;
-
-	uint8_t i;
-	uint8_t count;
-	uint32_t length;
-	uint32_t result;
-
-	/* FIXME: modify/increase if too limiting */
-	char json_buffer[1024];
-	char json_name[32];
-	char json_value[32];
-
-	unsigned long boot_r1 = 0;
-	unsigned long boot_r2 = 0;
-	unsigned long boot_r3 = 0;
-	unsigned long boot_addr = 0;
-
-	uint8_t image_found = 0;
-	uint8_t boot_addr_found = 0;
-
-	/* Read JSON file */
-	fr = f_mount(&fs, "", 1);
-	if (fr != FR_OK)
-		return;
-	fr = f_open(&file, filename, FA_READ);
-	if (fr != FR_OK) {
-		printf("%s file not found.\n", filename);
-		f_mount(0, "", 0);
-		return;
-	}
-
-	fr = f_read(&file, json_buffer, sizeof(json_buffer), &length);
-
-	/* Close JSON file */
-	f_close(&file);
-	f_mount(0, "", 0);
-
-	/* Parse JSON file */
-	jsmntok_t t[32];
-	jsmn_parser p;
-	jsmn_init(&p);
-	count = jsmn_parse(&p, json_buffer, strlen(json_buffer), t, sizeof(t)/sizeof(*t));
-	for (i=0; i<count-1; i++) {
-		memset(json_name,   0, sizeof(json_name));
-		memset(json_value,  0, sizeof(json_value));
-		/* Elements are JSON strings with 1 children */
-		if ((t[i].type == JSMN_STRING) && (t[i].size == 1)) {
-			/* Get Element's filename */
-			memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-			/* Get Element's address */
-			memcpy(json_value, json_buffer + t[i+1].start, t[i+1].end - t[i+1].start);
-			/* Skip bootargs (optional) */
-			if (strncmp(json_name, "bootargs", 8) == 0) {
-				continue;
-			}
-			/* Get boot addr (optional) */
-			else if (strncmp(json_name, "addr", 4) == 0) {
-				boot_addr = strtoul(json_value, NULL, 0);
-				boot_addr_found = 1;
-			}
-			/* Get boot r1 (optional) */
-			else if (strncmp(json_name, "r1", 2) == 0) {
-				memcpy(json_name, json_buffer + t[i].start, t[i].end - t[i].start);
-				boot_r1 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r2 (optional) */
-			else if (strncmp(json_name, "r2", 2) == 0) {
-				boot_r2 = strtoul(json_value, NULL, 0);
-			}
-			/* Get boot r3 (optional) */
-			else if (strncmp(json_name, "r3", 2) == 0) {
-				boot_r3 = strtoul(json_value, NULL, 0);
-			/* Copy Image from SDCard to address */
-			} else {
-				result = copy_file_from_sata_to_ram(json_name, strtoul(json_value, NULL, 0));
-				if (result == 0)
-					return;
-				image_found = 1;
-				if (boot_addr_found == 0) /* Boot to last Image address if no bootargs.addr specified */
-					boot_addr = strtoul(json_value, NULL, 0);
-			}
-		}
-	}
-
-	/* Boot */
-	if (image_found)
-		boot(boot_r1, boot_r2, boot_r3, boot_addr);
-}
-
-static void sataboot_from_bin(const char * filename)
-{
-	uint32_t result;
-	result = copy_file_from_sata_to_ram(filename, MAIN_RAM_BASE);
-	if (result == 0)
-		return;
-	boot(0, 0, 0, MAIN_RAM_BASE);
-}
-
-void sataboot(void)
+#ifdef CSR_SATA_SECTOR2MEM_BASE
+void sataboot(int nb_params, char **params)
 {
 	printf("Booting from SATA...\n");
-
-	/* Boot from boot.json */
-	printf("Booting from boot.json...\n");
-	sataboot_from_json("boot.json");
-
-	/* Boot from boot.bin */
-	printf("Booting from boot.bin...\n");
-	sataboot_from_bin("boot.bin");
-
-	/* Boot failed if we are here... */
+	fatfs_set_ops_sata();
+	fatfsboot(nb_params, params);
 	printf("SATA boot failed.\n");
 }
 #endif

@@ -1,5 +1,6 @@
 # This file is part of LiteX.
 #
+# Copyright (c) 2021 Antmicro <www.antmicro.com>
 # SPDX-License-Identifier: BSD-2-Clause
 #
 
@@ -9,7 +10,10 @@ import re
 from typing import Optional, Sequence, Any, Callable, Generator, Dict, Tuple
 
 from migen import *
-from migen.fhdl.namer import Namespace
+
+from litex.gen.fhdl.namer import SignalNamespace
+
+from litex.soc.interconnect import stream
 
 
 class SigTrace:
@@ -48,7 +52,7 @@ class GTKWSave:
     """
 
     def __init__(self,
-            vns: Namespace,
+            vns: SignalNamespace,
             savefile: str,
             dumpfile: str,
             filtersdir: str = None,
@@ -58,7 +62,7 @@ class GTKWSave:
 
         `prefix` is prepended to all signal names and defaults to the one used by Litex simulator.
         """
-        self.vns = vns   # Namespace output of Builder.build, required to resolve signal names
+        self.vns = vns   # SignalNamespace output of Builder.build, required to resolve signal names
         self.prefix = prefix
         self.savefile = savefile
         self.dumpfile = dumpfile
@@ -108,9 +112,7 @@ class GTKWSave:
             translation_files: Optional[Sequence[str]] = None,
             **kwargs):
         mappers = mappers or []
-        translation_files = translation_files or {}
-        if len(signals) == 1:
-            return self.signal(signals[0])
+        translation_files = translation_files or []
 
         names = [self.name(s) for s in signals]
         common = self.common_prefix(names)
@@ -127,6 +129,13 @@ class GTKWSave:
         for mapper in mappers:
             sigs = list(mapper(sigs))
 
+        if len(sigs) == 1:
+            s = sigs[0]
+            alias = None if s.alias == s.name else s.alias
+            self.gtkw.trace(self.prefix + s.name, alias=alias, color=s.color,
+                translate_filter_file=s.filter_file, **kwargs)
+            return
+
         with self.gtkw.group(group_name or common.strip("_"), closed=closed):
             for s in sigs:
                 self.gtkw.trace(self.prefix + s.name, alias=s.alias, color=s.color,
@@ -135,23 +144,43 @@ class GTKWSave:
     def by_regex(self, regex: Regex, **kwargs):
         pattern = re.compile(regex)
         signals = list(filter(
-            lambda sig: pattern.search(self.vns.pnd[sig]),
-            self.vns.pnd.keys()))
+            lambda sig: pattern.search(self.vns.name_dict[sig]),
+            self.vns.name_dict.keys()))
         assert len(signals) > 0, "No match found for {}".format(regex)
         return self.group(signals, **kwargs)
 
     def clocks(self, **kwargs):
         clks = [cd.clk for cd in self.vns.clock_domains]
+        if len(clks) == 0:
+            return
         self.group(clks, group_name="clocks", alias=False, closed=False, **kwargs)
 
-    def add(self, obj: Any, **kwargs):
-        # TODO: add automatic default handlers for Litex types (e.g. WishBone, AXI, streams, ...)
+    def add(self, obj: Any, no_defaults=False, **kwargs):
+        # TODO: add automatic default handlers for Litex types (e.g. WishBone, AXI, ...)
+
+        def default_mappers(types, mappers):
+            if not no_defaults and isinstance(obj, types):
+                kwargs["mappers"] = mappers + kwargs.get("mappers", [])
+
         if isinstance(obj, Record):
+            # automatic settings for supported Record types
+            default_mappers(stream.Endpoint, DEFAULT_ENDPOINT_MAPPERS)
             self.group([s for s, _ in obj.iter_flat()], **kwargs)
         elif isinstance(obj, Signal):
             self.signal(obj)
+        elif self._is_module_with_attrs(obj, ["sink", "source"], types=stream.Endpoint, required=any):
+            self._add_groupped_attrs(obj, ["sink", "source"], **kwargs)  # recurse to Record->Endpoint handler
         else:
             raise NotImplementedError(type(obj), obj)
+
+    def _add_groupped_attrs(self, obj, attrs, **kwargs):
+        # add given attributes of an object in an encapsulating group, with attribute names as subgroup names
+        with self.gtkw.group(kwargs["group_name"], closed=kwargs.get("closed", True)):
+            for attr in attrs:
+                if hasattr(obj, attr):
+                    new_kwargs = kwargs.copy()
+                    new_kwargs["group_name"] = attr
+                    self.add(getattr(obj, attr), **new_kwargs)
 
     def make_fsm_state_translation(self, fsm: FSM) -> str:
         # generate filter file
@@ -184,6 +213,8 @@ class GTKWSave:
     def fsm_states(self, soc: Module, alias: bool = True, **kwargs):
         fsms = list(filter(lambda module: isinstance(module, FSM), self.iter_submodules(soc)))
         states = [fsm.state for fsm in fsms]
+        if len(states) == 0:
+            return
         files = [self.make_fsm_state_translation(fsm) for fsm in fsms]
 
         if alias:
@@ -202,6 +233,13 @@ class GTKWSave:
         if name.endswith("]") and "[" in name:
             name = name[:name.rfind("[")]
         return name
+
+    @staticmethod
+    def _is_module_with_attrs(obj, attrs, types, required) -> bool:
+        if not isinstance(obj, Module):
+            return False
+        available = map(lambda a: hasattr(obj, a) and isinstance(getattr(obj, a), types), attrs)
+        return required(available)
 
 # Generic mappers ----------------------------------------------------------------------------------
 
@@ -320,3 +358,22 @@ def dfi_in_phase_colorer(**kwargs) -> SigMapper:
         "orange": suffixes2re(["wrdata_en", "wrdata", "wrdata_mask"]),
         "red":    suffixes2re(["rddata_en", "rddata", "rddata_valid"]),
     }, default="indigo", **kwargs)
+
+def endpoint_filter(firstlast=False, payload=True, param=True, **kwargs) -> SigMapper:
+    patterns = suffixes2re(["valid", "ready"])
+    if firstlast: patterns += suffixes2re(["first", "last"])
+    if payload:   patterns += ["payload_"]
+    if param:     patterns += ["param_"]
+    return regex_filter(patterns, **kwargs)
+
+def endpoint_sorter(**kwargs) -> SigMapper:
+    return regex_sorter(suffixes2re(["valid", "ready", "first", "last"]), **kwargs)
+
+def endpoint_colorer(**kwargs) -> SigMapper:
+    return regex_colorer({
+        "yellow": suffixes2re(["valid"]),
+        "orange": suffixes2re(["ready"]),
+        "indigo": suffixes2re(["first", "last"]),
+    }, default="normal", **kwargs)
+
+DEFAULT_ENDPOINT_MAPPERS = [endpoint_sorter(), endpoint_colorer()]

@@ -1,0 +1,568 @@
+import unittest
+import re
+
+from migen import *
+from migen.fhdl.decorators import ClockDomainsRenamer, ResetInserter
+from migen.fhdl.simplify import FullMemoryWE
+from migen.fhdl.specials import Tristate
+
+from litex.gen import LiteXContext
+from litex.gen.fhdl.hierarchy import LiteXHierarchyExplorer
+from litex.gen.fhdl.verilog import convert
+
+
+class _Leaf(Module):
+    def __init__(self):
+        # Intentionally unnamed submodule to exercise generated-name policy.
+        self.submodules += Module()
+
+
+class _Top(Module):
+    def __init__(self):
+        self.i = Signal()
+        self.o = Signal()
+        self.comb += self.o.eq(self.i)
+        self.submodules.leaf = _Leaf()
+        self.specials += Instance("MY_BB")
+
+
+class _TristateLeaf(Module):
+    def __init__(self, pad):
+        self.o  = Signal(name="leaf_o")
+        self.oe = Signal(name="leaf_oe")
+        self.i  = Signal(name="leaf_i")
+
+        self.comb += [
+            self.o.eq(1),
+            self.oe.eq(self.i),
+        ]
+        self.specials += Tristate(pad, self.o, self.oe, self.i)
+
+
+class _TristateTop(Module):
+    def __init__(self):
+        self.pad = Signal(name="pad")
+        self.submodules.leaf = _TristateLeaf(self.pad)
+
+
+class _SharedLeaf(Module):
+    def __init__(self, shared):
+        self.o = Signal(name="leaf_o")
+        self.comb += self.o.eq(shared)
+
+
+class _SharedTop(Module):
+    def __init__(self):
+        self.dummy  = Signal(name="dummy")
+        self.shared = Signal(name="shared")
+        self.submodules.leaf = _SharedLeaf(self.shared)
+
+
+class _InlineFSMLeaf(Module):
+    def __init__(self):
+        self.o = Signal(name="fsm_o")
+        self.submodules.fsm = FSM(reset_state="IDLE")
+        self.comb += self.o.eq(0)
+        self.fsm.act("IDLE",
+            NextState("RUN"),
+        )
+        self.fsm.act("RUN",
+            self.o.eq(1),
+            NextState("RUN"),
+        )
+
+
+class _InlineFSMTop(Module):
+    def __init__(self):
+        self.o = Signal(name="o")
+        self.submodules.leaf = _InlineFSMLeaf()
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _ClockRenamedInlineFSMTop(Module):
+    def __init__(self):
+        self.clock_domains.cd_eth_tx = ClockDomain("eth_tx")
+        self.o = Signal(name="o")
+        self.submodules.leaf = ClockDomainsRenamer("eth_tx")(_InlineFSMLeaf())
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _MemoryLeaf(Module):
+    def __init__(self):
+        self.o = Signal(8, name="mem_o")
+        mem = Memory(8, 4, init=[0x12, 0x34, 0x56, 0x78])
+        port = mem.get_port()
+        self.specials += mem
+        self.comb += [
+            port.adr.eq(0),
+            self.o.eq(port.dat_r),
+        ]
+
+
+class _MemoryTop(Module):
+    def __init__(self):
+        self.o = Signal(8, name="o")
+        self.submodules.leaf = _MemoryLeaf()
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _SharedMemoryOwner(Module):
+    def __init__(self, mem):
+        self.specials += mem
+
+
+class _SharedMemoryReader(Module):
+    def __init__(self, mem, adr):
+        self.dat_r = Signal(8, name="shared_mem_dat_r")
+        port = mem.get_port()
+        self.specials += mem
+        self.comb += [
+            port.adr.eq(adr),
+            self.dat_r.eq(port.dat_r),
+        ]
+
+
+class _SharedMemoryTop(Module):
+    def __init__(self):
+        self.adr = Signal(2, name="adr")
+        self.o = Signal(8, name="o")
+        mem = Memory(8, 4, init=[0x12, 0x34, 0x56, 0x78])
+        self.submodules.owner = _SharedMemoryOwner(mem)
+        self.submodules.reader = _SharedMemoryReader(mem, self.adr)
+        self.comb += self.o.eq(self.reader.dat_r)
+
+
+class _GrainMemoryTop(Module):
+    def __init__(self):
+        self.adr   = Signal(9)
+        self.dat_w = Signal(128)
+        self.we    = Signal(16)
+        self.dat_r = Signal(128)
+        mem = Memory(128, 512)
+        port = mem.get_port(write_capable=True, we_granularity=8)
+        self.specials += mem, port
+        self.comb += [
+            port.adr.eq(self.adr),
+            port.dat_w.eq(self.dat_w),
+            port.we.eq(self.we),
+            self.dat_r.eq(port.dat_r),
+        ]
+
+
+class _InlineDropLeaf(Module):
+    def __init__(self):
+        self.out = Signal(name="out")
+        self.comb += self.out.eq(1)
+
+
+class _InlineDropChild(Module):
+    def __init__(self):
+        self.trigger = Signal(name="trigger")
+        self.comb += self.trigger.eq(0) # Default, also driven by the top: the child is inlined.
+        self.submodules.leaf = _InlineDropLeaf()
+
+
+class _InlineDropTop(Module):
+    def __init__(self):
+        self.io = Signal(name="io")
+        self.submodules.child = _InlineDropChild()
+        self.comb += self.io.eq(self.child.leaf.out)
+        # Force the child and its subtree to be inlined (both drive trigger).
+        self.comb += self.child.trigger.eq(1)
+
+
+class _SharedInlinedPHY(Module):
+    def __init__(self):
+        self.trigger = Signal(name="trigger")
+        self.out     = Signal(name="out")
+        self.cnt     = Signal(4, name="cnt")
+        self.comb += [
+            self.trigger.eq(0), # Default, also driven by the top: the PHY is inlined.
+            self.out.eq(1),
+        ]
+        self.sync += self.cnt.eq(self.cnt + 1)
+
+
+class _SharedInlinedUser(Module):
+    def __init__(self, phy):
+        self.o = Signal(name="user_o")
+        # Also a submodule here (as LitePCIeEndpoint with its PHY): a shared alias of the PHY.
+        self.submodules.phy = phy
+        self.sync += self.o.eq(phy.out)
+
+
+class _SharedInlinedTop(Module):
+    def __init__(self):
+        self.io  = Signal(name="io")
+        self.cnt = Signal(4, name="top_cnt")
+        self.submodules.phy  = phy = _SharedInlinedPHY()
+        self.submodules.user = _SharedInlinedUser(phy)
+        self.comb += [
+            self.io.eq(self.user.o),
+            self.cnt.eq(phy.cnt),
+            phy.trigger.eq(1),
+        ]
+
+
+class _ParentDrivenChild(Module):
+    def __init__(self):
+        self.valid = Signal(name="child_valid")
+        self.o     = Signal(name="child_o")
+        self.sync += self.o.eq(self.valid)
+
+
+class _ParentDrivenTop(Module):
+    def __init__(self):
+        self.i = Signal(name="i")
+        self.o = Signal(name="o")
+        self.submodules.child = _ParentDrivenChild()
+        self.comb += [
+            self.child.valid.eq(self.i),
+            self.o.eq(self.child.o),
+        ]
+
+
+class _AliasedClockChild(Module):
+    def __init__(self):
+        self.o = Signal(name="aliased_o")
+        self.clock_domains.cd_tx = ClockDomain()
+        self.cd_tx.clk = ClockSignal("sys") # Shared clock, as LiteICLink's tx_clk.
+        self.sync.tx += self.o.eq(~self.o)
+
+
+class _AliasedClockTop(Module):
+    def __init__(self):
+        self.o = Signal(name="o")
+        self.submodules.child = _AliasedClockChild()
+        self.comb += self.o.eq(self.child.o)
+
+
+class _RenamedLeaf(Module):
+    def __init__(self):
+        self.i = Signal(8, name="leaf_i")
+        self.o = Signal(8, name="leaf_o")
+        self.sync += self.o.eq(self.i + 1)
+
+
+class _RenamedMid(Module):
+    def __init__(self):
+        self.i   = Signal(8, name="mid_i")
+        self.o   = Signal(8, name="mid_o")
+        self.clr = Signal(name="clr")
+        self.submodules.leaf = leaf = ResetInserter()(_RenamedLeaf())
+        self.comb += [
+            leaf.reset.eq(self.clr),
+            leaf.i.eq(self.i),
+            self.o.eq(leaf.o),
+        ]
+
+
+class _RenamedTop(Module):
+    def __init__(self):
+        self.i   = Signal(8, name="i")
+        self.o   = Signal(8, name="o")
+        self.clr = Signal(name="top_clr")
+        self.clock_domains.cd_sys  = ClockDomain()
+        self.clock_domains.cd_link = ClockDomain()
+        self.submodules.mid = mid = ClockDomainsRenamer("link")(_RenamedMid())
+        self.comb += [
+            mid.i.eq(self.i),
+            mid.clr.eq(self.clr),
+            self.o.eq(mid.o),
+        ]
+
+
+class _UndrivenLeaf(Module):
+    def __init__(self, ce):
+        self.o = Signal(name="undriven_o")
+        self.sync += If(ce, self.o.eq(~self.o))
+
+
+class _UndrivenMid(Module):
+    def __init__(self):
+        self.ce = Signal(reset=1, name="ce") # Never assigned: a constant 1.
+        self.o  = Signal(name="mid_o")
+        self.submodules.leaf = _UndrivenLeaf(self.ce)
+        self.comb += self.o.eq(self.leaf.o)
+
+
+class _UndrivenTop(Module):
+    def __init__(self):
+        self.o = Signal(name="o")
+        self.submodules.mid = _UndrivenMid()
+        self.comb += self.o.eq(self.mid.o)
+
+
+class TestHierarchicalVerilog(unittest.TestCase):
+    @staticmethod
+    def _module_body(verilog, name):
+        match = re.search(rf"module {name} \(.*?endmodule", verilog, re.S)
+        if match is None:
+            raise AssertionError(f"module {name} not found")
+        return match.group(0)
+
+    def test_hierarchy_golden_text(self):
+        expected = "\n".join([
+            "_Top",
+            "\u251c\u2500\u2500 leaf (_Leaf)",
+            "\u2502    \u2514\u2500\u2500 module_0 (Module) [Gen]",
+            "\u2514\u2500\u2500 [BB:MY_BB]",
+            "Legend:",
+            "  [Gen]: Auto-generated instance name.",
+            "  [BB:NAME]: Blackbox instance (verilog Instance).",
+            "",
+        ])
+
+        hierarchy = LiteXHierarchyExplorer(top=_Top(), with_colors=False).get_hierarchy()
+        self.assertEqual(hierarchy, expected)
+
+    def test_flat_and_hierarchical_smoke(self):
+        flat_top = _Top()
+        hier_top = _Top()
+        flat_ios = {flat_top.i, flat_top.o}
+        hier_ios = {hier_top.i, hier_top.o}
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = flat_top
+
+            flat = convert(flat_top, ios=flat_ios, name="top", hierarchical=False).main_source
+            LiteXContext.top = hier_top
+            hier = convert(hier_top, ios=hier_ios, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        # Parity smoke: top-level interface and direct path are present in both.
+        self.assertIn("module top (", flat)
+        self.assertIn("module top (", hier)
+        self.assertRegex(flat, r"input\s+wire\s+i")
+        self.assertRegex(hier, r"input\s+wire\s+i")
+        self.assertRegex(flat, r"output\s+wire\s+o")
+        self.assertRegex(hier, r"output\s+wire\s+o")
+        self.assertIn("assign o = i;", flat)
+        self.assertIn("assign o = i;", hier)
+
+        # Hierarchical mode should emit child module and submodule instantiation.
+        self.assertIn("module top__leaf", hier)
+        self.assertIn("top__leaf leaf", hier)
+
+    def test_hierarchical_tristate_keeps_child_controls_local(self):
+        top = _TristateTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.pad}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"inout\s+wire\s+pad")
+        self.assertNotRegex(leaf_module.split(");", 1)[0], r"leaf_[ioe]")
+        self.assertRegex(leaf_module, r"wire\s+leaf_i;")
+        self.assertRegex(leaf_module, r"wire\s+leaf_o;")
+        self.assertRegex(leaf_module, r"wire\s+leaf_oe;")
+        self.assertIn("assign pad = leaf_oe ? leaf_o : 1'bz;", leaf_module)
+        self.assertIn("assign leaf_i = pad;", leaf_module)
+
+        self.assertIn(".pad(pad)", top_module)
+        self.assertNotIn("leaf_i", top_module)
+        self.assertNotIn("leaf_o", top_module)
+        self.assertNotIn("leaf_oe", top_module)
+
+    def test_hierarchical_parent_signal_used_by_child_is_port(self):
+        leaf = _SharedTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = leaf
+            verilog = convert(leaf, ios={leaf.dummy}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"input\s+wire\s+shared")
+        self.assertIn(".shared(shared)", top_module)
+
+    def test_hierarchical_inline_child_statements_are_not_duplicated(self):
+        top = _InlineFSMTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertEqual(leaf_module.count("case (state)"), 1)
+        self.assertEqual(leaf_module.count("always @(posedge sys_clk)"), 1)
+        self.assertIn(".fsm_o(fsm_o)", top_module)
+        self.assertNotIn(".state(state)", top_module)
+        self.assertNotIn(".next_state(next_state)", top_module)
+
+    def test_hierarchical_inline_child_preserves_renamed_clock_domain(self):
+        top = _ClockRenamedInlineFSMTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+
+        self.assertEqual(leaf_module.count("always @(posedge eth_tx_clk)"), 1)
+        self.assertNotIn("sys_clk", leaf_module)
+        self.assertNotIn("sys_rst", leaf_module)
+
+    def test_hierarchical_memory_port_declares_clock(self):
+        top = _MemoryTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        leaf_module = self._module_body(verilog, "top__leaf")
+        top_module  = self._module_body(verilog, "top")
+
+        self.assertRegex(leaf_module, r"input\s+wire\s+sys_clk")
+        self.assertIn("always @(posedge sys_clk)", leaf_module)
+        self.assertIn(".sys_clk(sys_clk)", top_module)
+
+    def test_hierarchical_inlined_child_keeps_grandchild_logic(self):
+        top = _InlineDropTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.io}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        top_module = self._module_body(verilog, "top")
+
+        self.assertEqual(verilog.count("assign out = 1'd1"), 1)
+        self.assertIn("assign out = 1'd1", top_module)
+        self.assertNotIn("module top__child (", verilog)
+        self.assertNotIn("module top__child__leaf (", verilog)
+
+    def test_hierarchical_inlined_child_shared_with_a_hierarchical_sibling(self):
+        # The PHY is inlined in the top and is a shared alias under the user module: its logic must still be
+        # emitted (once), the alias isn't.
+        top = _SharedInlinedTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.io, top.cnt}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        self.assertEqual(verilog.count("assign out = 1'd1"), 1)
+        self.assertEqual(len(re.findall(r"cnt <= \(cnt \+ 1'd1\);", verilog)), 1)
+
+    def test_hierarchical_parent_driven_child_signal_is_input_port(self):
+        # A signal of the child only driven by the parent: input port, the child stays a module.
+        top = _ParentDrivenTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.i, top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        child_module = self._module_body(verilog, "top__child")
+        self.assertRegex(child_module, r"input\s+wire\s+child_valid")
+        self.assertIn("child_o <= child_valid;", child_module)
+
+    def test_hierarchical_clock_domain_with_clock_signal_clk(self):
+        # A ClockDomain whose clk is another domain's ClockSignal: the real clock is a port of the child.
+        top = _AliasedClockTop()
+        top.clock_domains.cd_sys = ClockDomain()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o, top.cd_sys.clk, top.cd_sys.rst}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        child_module = self._module_body(verilog, "top__child")
+        self.assertRegex(child_module, r"input\s+wire\s+sys_clk")
+        self.assertIn("always @(posedge sys_clk) begin", child_module)
+
+    def test_hierarchical_ancestor_rename_reaches_descendants(self):
+        # ClockDomainsRenamer on a module kept hierarchical: its descendants' sync logic is in the renamed domain.
+        top = _RenamedTop()
+        ios = {top.i, top.o, top.clr, top.cd_sys.clk, top.cd_sys.rst, top.cd_link.clk, top.cd_link.rst}
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios=ios, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        self.assertEqual(set(re.findall(r"always @\(posedge (\w+)\)", verilog)), {"link_clk"})
+
+    def test_hierarchical_undriven_signal_keeps_reset_value(self):
+        # A signal nobody drives between two modules keeps its reset value (reg), not an undriven wire.
+        top = _UndrivenTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        self.assertRegex(verilog, r"reg\s+ce = 1'd1;")
+        self.assertNotRegex(verilog, r"wire\s+ce;")
+
+    def test_hierarchical_shared_memory_is_emitted_once(self):
+        top = _SharedMemoryTop()
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.adr, top.o}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        owner_module = self._module_body(verilog, "top__owner")
+        reader_module = self._module_body(verilog, "top__reader")
+
+        self.assertEqual(verilog.count("reg [7:0] mem[0:3];"), 1)
+        self.assertIn("reg [7:0] mem[0:3];", owner_module)
+        self.assertNotIn("reg [7:0] mem[0:3];", reader_module)
+        self.assertRegex(owner_module, r"output\s+wire\s+\[7:0\]\s+dat_r")
+        self.assertRegex(reader_module, r"input\s+wire\s+\[7:0\]\s+dat_r")
+
+    def test_hierarchical_grain_memory_port_dat_r_is_wire(self):
+        # Wide memory with byte-granular write enables: FullMemoryWE splits it
+        # into byte grains whose read-data slices are assembled via continuous
+        # assigns. The aggregate dat_r must be declared wire (like the flat
+        # converter does), never reg, or synthesis rejects it (Synth 8-9315).
+        top = FullMemoryWE()(_GrainMemoryTop())
+
+        old_top = LiteXContext.top
+        try:
+            LiteXContext.top = top
+            verilog = convert(top, ios={top.adr, top.dat_w, top.we, top.dat_r}, name="top", hierarchical=True).main_source
+        finally:
+            LiteXContext.top = old_top
+
+        self.assertRegex(verilog, r"wire\s+\[127:0\]")
+        self.assertNotRegex(verilog, r"reg\s+\[127:0\]")

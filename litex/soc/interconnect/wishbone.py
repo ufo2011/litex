@@ -4,21 +4,23 @@
 # Copyright (c) 2015 Sebastien Bourdeauducq <sb@m-labs.hk>
 # Copyright (c) 2015-2020 Florent Kermarrec <florent@enjoy-digital.fr>
 # Copyright (c) 2018 Tim 'mithro' Ansell <me@mith.ro>
+# Copyright (c) 2022 Antmicro <www.antmicro.com>
 # SPDX-License-Identifier: BSD-2-Clause
 
-from math import log2
+"""Wishbone Classic support for LiteX (Standard HandShaking/Synchronous Feedback)"""
 
-from functools import reduce
-from operator import or_
+from math import log2
 
 from migen import *
 from migen.genlib import roundrobin
 from migen.genlib.record import *
-from migen.genlib.misc import split, displacer, chooser, WaitTimer
+
+from litex.gen import *
+from litex.gen.genlib.misc import split, displacer, chooser, WaitTimer
 
 from litex.build.generic_platform import *
 
-from litex.soc.interconnect import csr, csr_bus
+from litex.soc.interconnect import csr, csr_bus, stream
 
 # Wishbone Definition ------------------------------------------------------------------------------
 
@@ -36,15 +38,32 @@ _layout = [
     ("err",              1, DIR_S_TO_M)
 ]
 
+CTI_BURST_NONE         = 0b000
+CTI_BURST_CONSTANT     = 0b001
+CTI_BURST_INCREMENTING = 0b010
+CTI_BURST_END          = 0b111
+
 
 class Interface(Record):
-    def __init__(self, data_width=32, adr_width=30):
+    def __init__(self, data_width=32, adr_width=30, bursting=False, addressing="word", mode="rw", **kwargs):
+        if addressing not in ["word", "byte"]:
+            raise ValueError("Unsupported Wishbone addressing: {}.".format(addressing))
+        if mode not in ["rw", "r", "w"]:
+            raise ValueError("Unsupported Wishbone mode: {}.".format(mode))
         self.data_width = data_width
-        self.adr_width  = adr_width
+        if kwargs.get("address_width", False):
+            # FIXME: Improve or switch Wishbone to byte addressing instead of word addressing.
+            adr_width = kwargs["address_width"] - int(log2(data_width//8))
+        self.adr_width     = adr_width + (int(log2(data_width//8)) if (addressing == "byte") else 0)
+        self.address_width = adr_width + (0 if (addressing == "byte") else int(log2(data_width//8)))
+        self.bursting      = bursting
+        self.addressing    = addressing
+        self.mode          = mode
         Record.__init__(self, set_layout_parameters(_layout,
-            adr_width  = adr_width,
-            data_width = data_width,
-            sel_width  = data_width//8))
+            adr_width  = self.adr_width,
+            data_width = self.data_width,
+            sel_width  = self.data_width//8,
+        ))
         self.adr.reset_less   = True
         self.dat_w.reset_less = True
         self.dat_r.reset_less = True
@@ -52,7 +71,13 @@ class Interface(Record):
 
     @staticmethod
     def like(other):
-        return Interface(len(other.dat_w))
+        return Interface(
+            data_width    = other.data_width,
+            address_width = other.address_width,
+            bursting      = other.bursting,
+            addressing    = other.addressing,
+            mode          = other.mode,
+        )
 
     def _do_transaction(self):
         yield self.cyc.eq(1)
@@ -63,19 +88,31 @@ class Interface(Record):
         yield self.cyc.eq(0)
         yield self.stb.eq(0)
 
-    def write(self, adr, dat, sel=None):
+    def write(self, adr, dat, sel=None, cti=None, bte=None):
         if sel is None:
             sel = 2**len(self.sel) - 1
         yield self.adr.eq(adr)
         yield self.dat_w.eq(dat)
         yield self.sel.eq(sel)
+        if cti is not None:
+            yield self.cti.eq(cti)
+        if bte is not None:
+            yield self.bte.eq(bte)
         yield self.we.eq(1)
         yield from self._do_transaction()
+        if (yield self.err):
+            raise ValueError("bus error")
 
-    def read(self, adr):
+    def read(self, adr, cti=None, bte=None):
         yield self.adr.eq(adr)
         yield self.we.eq(0)
+        if cti is not None:
+            yield self.cti.eq(cti)
+        if bte is not None:
+            yield self.bte.eq(bte)
         yield from self._do_transaction()
+        if (yield self.err):
+            raise ValueError("bus error")
         return (yield self.dat_r)
 
     def get_ios(self, bus_name="wb"):
@@ -86,7 +123,8 @@ class Interface(Record):
         return ios
 
     def connect_to_pads(self, pads, mode="master"):
-        assert mode in ["slave", "master"]
+        if mode not in ["slave", "master"]:
+            raise ValueError("Unsupported Wishbone pads mode: {}.".format(mode))
         r = []
         for name, width, direction in self.layout:
             sig  = getattr(self, name)
@@ -103,15 +141,213 @@ class Interface(Record):
                     r.append(sig.eq(pad))
         return r
 
+# Wishbone Remapper --------------------------------------------------------------------------------
+
+class Remapper(Module):
+    """
+    Wishbone Remapper that supports sequential application of:
+    - An initial origin offset and address mask.
+    - Region-based remapping from specified source regions to destination regions.
+    This allows for an initial origin remap followed by more complex/specific region-based remapping.
+    """
+    def __init__(self, master, slave, origin=0, size=None, src_regions=None, dst_regions=None):
+        # Parameters.
+        # -----------
+        src_regions = src_regions or []
+        dst_regions = dst_regions or []
+        if master.addressing != slave.addressing:
+            raise ValueError("Wishbone master/slave addressing mismatch.")
+        if len(src_regions) != len(dst_regions):
+            raise ValueError("Wishbone remapper source/destination region count mismatch.")
+
+        # Master to Slave.
+        # ----------------
+        self.comb += master.connect(slave)
+
+        # Origin Remapping.
+        # -----------------
+        # Compute Address Mask.
+        if size is None:
+            size = 2**master.address_width
+        log2_size = int(log2(size))
+        if master.addressing == "word":
+            log2_size -=  int(log2(len(master.dat_w)//8))
+            origin    >>= int(log2(len(master.dat_w)//8))
+        adr_mask  = 2**log2_size - 1
+        # Apply Address Origin/Mask Remapping.
+        adr_remap = (origin | (master.adr & adr_mask))
+        self.comb += slave.adr.eq(adr_remap)
+
+        # Regions Remapping.
+        # ------------------
+        # Compute Address Shift.
+        adr_shift = {
+            "byte" : 0,
+            "word" : int(log2(len(master.dat_w)//8)),
+        }[master.addressing]
+        # Apply Address Regions Remapping.
+        for src_region, dst_region in zip(src_regions, dst_regions):
+            src_adr = Signal(len(master.adr) + adr_shift + 1)
+            dst_adr = Signal(len(master.adr) + adr_shift + 1)
+            active  = Signal()
+            self.comb += [
+                src_adr.eq(adr_remap << adr_shift),
+                dst_adr.eq(dst_region.origin + src_adr - src_region.origin),
+                active.eq((src_adr >= src_region.origin) & (src_adr < (src_region.origin + src_region.size))),
+                If(active, slave.adr.eq(dst_adr >> adr_shift))
+            ]
+
+# Wishbone Offset --------------------------------------------------------------------------------
+
+class Offset(Module):
+    """Removes offset from Wishbone addresses."""
+    def __init__(self, master, slave, offset=0x00000000):
+        # Parameters.
+        # -----------
+        if master.addressing != slave.addressing:
+            raise ValueError("Wishbone master/slave addressing mismatch.")
+
+        # Master to Slave.
+        # ----------------
+        self.comb += master.connect(slave)
+
+        # Origin Remapping.
+        # -----------------
+        if master.addressing == "word":
+            offset    >>= int(log2(len(master.dat_w)//8))
+        # Apply Address Origin/Mask Remapping.
+        self.comb += slave.adr.eq(master.adr - offset)
+
+# Wishbone Clock Domain Crossing -------------------------------------------------------------------
+
+class ClockDomainCrossing(LiteXModule):
+    def __init__(self, master, slave, cd_from="sys", cd_to="sys"):
+        assert isinstance(master, Interface)
+        assert isinstance(slave,  Interface)
+        assert len(master.adr)   == len(slave.adr)
+        assert len(master.dat_w) == len(slave.dat_w)
+        assert len(master.dat_r) == len(slave.dat_r)
+        assert len(master.sel)   == len(slave.sel)
+        assert len(master.cti)   == len(slave.cti)
+        assert len(master.bte)   == len(slave.bte)
+
+        # Same Clock Domain, direct connection.
+        if cd_from == cd_to:
+            self.comb += master.connect(slave)
+            return
+
+        # # #
+
+        request_layout = [
+            ("adr",   len(master.adr)),
+            ("dat_w", len(master.dat_w)),
+            ("sel",   len(master.sel)),
+            ("we",    1),
+            ("cti",   len(master.cti)),
+            ("bte",   len(master.bte)),
+        ]
+        response_layout = [
+            ("dat_r", len(master.dat_r)),
+            ("err",   1),
+        ]
+
+        request_cdc  = stream.ClockDomainCrossing(request_layout,  cd_from, cd_to)
+        response_cdc = stream.ClockDomainCrossing(response_layout, cd_to,   cd_from)
+        self.submodules += request_cdc, response_cdc
+
+        # Master side.
+        master_active = Signal()
+        master_fsm = ClockDomainsRenamer(cd_from)(FSM(reset_state="IDLE"))
+        self.submodules.master_fsm = master_fsm
+
+        self.comb += [
+            master_active.eq(master.cyc & master.stb),
+            request_cdc.sink.adr.eq(master.adr),
+            request_cdc.sink.dat_w.eq(master.dat_w),
+            request_cdc.sink.sel.eq(master.sel),
+            request_cdc.sink.we.eq(master.we),
+            request_cdc.sink.cti.eq(master.cti),
+            request_cdc.sink.bte.eq(master.bte),
+        ]
+
+        master_fsm.act("IDLE",
+            request_cdc.sink.valid.eq(master_active),
+            If(request_cdc.sink.valid & request_cdc.sink.ready,
+                NextState("WAIT-RESPONSE")
+            )
+        )
+        master_fsm.act("WAIT-RESPONSE",
+            master.dat_r.eq(response_cdc.source.dat_r),
+            master.ack.eq(response_cdc.source.valid & master_active & ~response_cdc.source.err),
+            master.err.eq(response_cdc.source.valid & master_active &  response_cdc.source.err),
+            response_cdc.source.ready.eq(1),
+            If(response_cdc.source.valid,
+                NextState("IDLE")
+            ).Elif(~master_active,
+                NextState("DISCARD-RESPONSE")
+            )
+        )
+        master_fsm.act("DISCARD-RESPONSE",
+            response_cdc.source.ready.eq(1),
+            If(response_cdc.source.valid,
+                NextState("IDLE")
+            )
+        )
+
+        # Slave side.
+        request     = Record(request_layout)
+        response    = Record(response_layout)
+        slave_fsm   = ClockDomainsRenamer(cd_to)(FSM(reset_state="IDLE"))
+        self.submodules.slave_fsm = slave_fsm
+
+        self.comb += [
+            slave.adr.eq(request.adr),
+            slave.dat_w.eq(request.dat_w),
+            slave.sel.eq(request.sel),
+            slave.we.eq(request.we),
+            slave.cti.eq(request.cti),
+            slave.bte.eq(request.bte),
+            response_cdc.sink.dat_r.eq(response.dat_r),
+            response_cdc.sink.err.eq(response.err),
+        ]
+
+        slave_fsm.act("IDLE",
+            request_cdc.source.ready.eq(1),
+            If(request_cdc.source.valid,
+                NextValue(request.adr,   request_cdc.source.adr),
+                NextValue(request.dat_w, request_cdc.source.dat_w),
+                NextValue(request.sel,   request_cdc.source.sel),
+                NextValue(request.we,    request_cdc.source.we),
+                NextValue(request.cti,   request_cdc.source.cti),
+                NextValue(request.bte,   request_cdc.source.bte),
+                NextState("ACCESS")
+            )
+        )
+        slave_fsm.act("ACCESS",
+            slave.cyc.eq(1),
+            slave.stb.eq(1),
+            If(slave.ack | slave.err,
+                NextValue(response.dat_r, slave.dat_r),
+                NextValue(response.err,   slave.err),
+                NextState("RESPOND")
+            )
+        )
+        slave_fsm.act("RESPOND",
+            response_cdc.sink.valid.eq(1),
+            If(response_cdc.sink.ready,
+                NextState("IDLE")
+            )
+        )
+
 # Wishbone Timeout ---------------------------------------------------------------------------------
 
-class Timeout(Module):
+class Timeout(LiteXModule):
     def __init__(self, master, cycles):
         self.error = Signal()
 
         # # #
 
-        timer = WaitTimer(int(cycles))
+        timer = WaitTimer(cycles)
         self.submodules += timer
         self.comb += [
             timer.wait.eq(master.stb & master.cyc & ~master.ack),
@@ -124,14 +360,46 @@ class Timeout(Module):
 
 # Wishbone Interconnect ----------------------------------------------------------------------------
 
-class InterconnectPointToPoint(Module):
+def get_check_parameters(ports):
+    # FIXME: Add adr_width check.
+
+    # Data-Width.
+    data_width = ports[0].data_width
+    if len(ports) > 1:
+        for port in ports[1:]:
+            if port.data_width != data_width:
+                raise ValueError(f"Wishbone Interfaces with different Data-Widths connected to the same Interconnect ({port.data_width} vs {data_width}).")
+
+    # Addressing. Arbiter/Decoder copy adr bit-for-bit, so mixing word/byte-addressed Interfaces
+    # would silently mis-route accesses.
+    addressing = ports[0].addressing
+    if len(ports) > 1:
+        for port in ports[1:]:
+            if port.addressing != addressing:
+                raise ValueError(f"Wishbone Interfaces with different Addressings connected to the same Interconnect ({port.addressing} vs {addressing}).")
+
+    return data_width, addressing
+
+class InterconnectPointToPoint(LiteXModule):
     def __init__(self, master, slave):
         self.comb += master.connect(slave)
 
 
-class Arbiter(Module):
-    def __init__(self, masters, target):
-        self.submodules.rr = roundrobin.RoundRobin(len(masters))
+class Arbiter(LiteXModule):
+    def __init__(self, masters=None, target=None, controllers=None, mode="cycle"):
+        assert target is not None
+        assert (masters is not None) or (controllers is not None)
+        if controllers is not None:
+            masters = controllers
+
+        if mode == "cycle":
+            self.rr = roundrobin.RoundRobin(len(masters))
+        elif mode == "transaction":
+            self.rr = roundrobin.RoundRobin(len(masters), roundrobin.SP_CE)
+            cycs = Array(m.cyc for m in masters)
+            self.comb += self.rr.ce.eq(target.ack | target.err | ~cycs[self.rr.grant])
+        else:
+            raise ValueError(f"Unsupported Wishbone Arbiter mode: {mode}.")
 
         # mux master->slave signals
         for name, size, direction in _layout:
@@ -155,7 +423,7 @@ class Arbiter(Module):
         self.comb += self.rr.request.eq(Cat(*reqs))
 
 
-class Decoder(Module):
+class Decoder(LiteXModule):
     # slaves is a list of pairs:
     # 0) function that takes the address signal and returns a FHDL expression
     #    that evaluates to 1 when the slave is selected and 0 otherwise.
@@ -187,39 +455,43 @@ class Decoder(Module):
 
         # generate master ack (resp. err) by ORing all slave acks (resp. errs)
         self.comb += [
-            master.ack.eq(reduce(or_, [slave[1].ack for slave in slaves])),
-            master.err.eq(reduce(or_, [slave[1].err for slave in slaves]))
+            master.ack.eq(Reduce("OR", [slave[1].ack for slave in slaves])),
+            master.err.eq(Reduce("OR", [slave[1].err for slave in slaves]))
         ]
 
         # mux (1-hot) slave data return
         masked = [Replicate(slave_sel_r[i], len(master.dat_r)) & slaves[i][1].dat_r for i in range(ns)]
-        self.comb += master.dat_r.eq(reduce(or_, masked))
+        self.comb += master.dat_r.eq(Reduce("OR", masked))
 
 
-class InterconnectShared(Module):
-    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6):
-        shared = Interface()
-        self.submodules.arbiter = Arbiter(masters, shared)
-        self.submodules.decoder = Decoder(shared, slaves, register)
+class InterconnectShared(LiteXModule):
+    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6, arbiter="cycle"):
+        data_width, addressing = get_check_parameters(ports=masters + [s for _, s in slaves])
+        adr_width = max([m.adr_width for m in masters])
+        shared = Interface(data_width=data_width, adr_width=adr_width, addressing=addressing)
+        self.arbiter = Arbiter(masters, shared, mode=arbiter)
+        self.decoder = Decoder(shared, slaves, register)
         if timeout_cycles is not None:
-            self.submodules.timeout = Timeout(shared, timeout_cycles)
+            self.timeout = Timeout(shared, timeout_cycles)
 
 
-class Crossbar(Module):
-    def __init__(self, masters, slaves, register=False):
+class Crossbar(LiteXModule):
+    def __init__(self, masters, slaves, register=False, timeout_cycles=1e6, arbiter="cycle"):
+        data_width, addressing = get_check_parameters(ports=masters + [s for _, s in slaves])
         matches, busses = zip(*slaves)
-        access = [[Interface() for j in slaves] for i in masters]
+        adr_width = max([m.adr_width for m in masters])
+        access = [[Interface(data_width=data_width, adr_width=adr_width, addressing=addressing) for j in slaves] for i in masters]
         # decode each master into its access row
         for row, master in zip(access, masters):
             row = list(zip(matches, row))
             self.submodules += Decoder(master, row, register)
         # arbitrate each access column onto its slave
         for column, bus in zip(zip(*access), busses):
-            self.submodules += Arbiter(column, bus)
+            self.submodules += Arbiter(column, bus, mode=arbiter)
 
 # Wishbone Data Width Converter --------------------------------------------------------------------
 
-class DownConverter(Module):
+class DownConverter(LiteXModule):
     """DownConverter
 
     This module splits Wishbone accesses from a master interface to a smaller slave interface.
@@ -234,73 +506,115 @@ class DownConverter(Module):
 
     """
     def __init__(self, master, slave):
+        # Parameters/Checks.
+        # FIXME: Test/Remove byte addressing limitation.
+        if master.addressing != "word":
+            raise ValueError("Master must be word-addressed (byte addressing not supported).")
+        if slave.addressing != "word":
+            raise ValueError("Slave must be word-addressed (byte addressing not supported).")
         dw_from = len(master.dat_w)
         dw_to   = len(slave.dat_w)
         ratio   = dw_from//dw_to
 
         # # #
 
-        skip    = Signal()
-        counter = Signal(max=ratio)
+        # Signals.
+        skip  = Signal()
+        done  = Signal()
+        count = Signal(max=ratio)
+        # Latch sub-access errors to report them on the final beat (a Wishbone err, with or
+        # without ack, previously hung the converter or was silently reported as a clean ack).
+        err   = Signal()
 
-        # Control Path
-        fsm = FSM(reset_state="IDLE")
-        fsm = ResetInserter()(fsm)
-        self.submodules.fsm = fsm
-        self.comb += fsm.reset.eq(~master.cyc)
-        fsm.act("IDLE",
-            NextValue(counter, 0),
+        # Control Path.
+        self.comb += [
+            done.eq(count == (ratio - 1)),
+
+            Case(master.cti, {
+                # incrementing address burst cycle
+                CTI_BURST_INCREMENTING: slave.cti.eq(CTI_BURST_INCREMENTING),
+                # end current burst cycle
+                CTI_BURST_END: slave.cti.eq(Mux(done, CTI_BURST_END,
+                                                CTI_BURST_INCREMENTING)),
+                # unsupported burst cycle
+                "default": slave.cti.eq(CTI_BURST_NONE),
+            }),
+            # wrap conversion not supported
+            If(master.bte != 0, slave.cti.eq(CTI_BURST_NONE)),
+
             If(master.stb & master.cyc,
-                NextState("CONVERT"),
-            )
-        )
-        fsm.act("CONVERT",
-            slave.adr.eq(Cat(counter, master.adr)),
-            Case(counter, {i: slave.sel.eq(master.sel[i*dw_to//8:]) for i in range(ratio)}),
-            If(master.stb & master.cyc,
-                skip.eq(slave.sel == 0),
-                slave.we.eq(master.we),
+                skip.eq((slave.sel == 0) & (slave.cti == CTI_BURST_NONE)),
                 slave.cyc.eq(~skip),
                 slave.stb.eq(~skip),
-                If(slave.ack | skip,
-                    NextValue(counter, counter + 1),
-                    If(counter == (ratio - 1),
-                        master.ack.eq(1),
-                        NextState("IDLE")
+                slave.we.eq(master.we),
+                If(slave.ack | slave.err | skip,
+                    If(err | slave.err,
+                        master.err.eq(done)
+                    ).Else(
+                        master.ack.eq(done)
                     )
                 )
             )
-        )
+        ]
+        self.sync += [
+            If((slave.stb & slave.cyc & (slave.ack | slave.err)) | skip,
+                count.eq(count + 1),
+                If(slave.err,
+                    err.eq(1)
+                )
+            ),
+            If(master.ack | master.err | ~master.cyc,
+                count.eq(0),
+                err.eq(0)
+            )
+        ]
 
-        # Write Datapath
-        self.comb += Case(counter, {i: slave.dat_w.eq(master.dat_w[i*dw_to:]) for i in range(ratio)})
+        # Address.
+        self.comb += slave.adr.eq(Cat(count, master.adr))
 
-        # Read Datapath
+        # Write Datapath.
+        self.comb += Case(count, {i: slave.dat_w.eq(master.dat_w[i*dw_to:]) for i in range(ratio)})
+        self.comb += Case(count, {i: slave.sel.eq(master.sel[i*dw_to//8:])  for i in range(ratio)}),
+
+        # Read Datapath.
         dat_r = Signal(dw_from, reset_less=True)
         self.comb += master.dat_r.eq(Cat(dat_r[dw_to:], slave.dat_r))
         self.sync += If(slave.ack | skip, dat_r.eq(master.dat_r))
 
-class UpConverter(Module):
+class UpConverter(LiteXModule):
     """UpConverter"""
     def __init__(self, master, slave):
+        # Parameters/Checks.
+        # FIXME: Test/Remove byte addressing limitation.
+        if master.addressing != "word":
+            raise ValueError("Master must be word-addressed (byte addressing not supported).")
+        if slave.addressing != "word":
+            raise ValueError("Slave must be word-addressed (byte addressing not supported).")
         dw_from = len(master.dat_w)
         dw_to   = len(slave.dat_w)
         ratio   = dw_to//dw_from
 
         # # #
 
-        self.comb += master.connect(slave, omit={"adr", "sel", "dat_w", "dat_r"})
+        # A narrow master burst can span multiple lanes of a single wider slave word.
+        # Forwarding CTI/BTE as a native wide burst would make bursting slaves advance
+        # the address too early, so collapse the widened side to classic cycles.
+        self.comb += master.connect(slave, omit={"adr", "sel", "dat_w", "dat_r", "cti", "bte"})
+        self.comb += [
+            slave.cti.eq(CTI_BURST_NONE),
+            slave.bte.eq(0),
+        ]
         cases = {}
         for i in range(ratio):
             cases[i] = [
                 slave.adr.eq(master.adr[int(log2(ratio)):]),
-                slave.sel[i*dw_from//8:(i+1)*dw_from//8].eq(2**(dw_from//8) - 1),
+                slave.sel[i*dw_from//8:(i+1)*dw_from//8].eq(master.sel),
                 slave.dat_w[i*dw_from:(i+1)*dw_from].eq(master.dat_w),
                 master.dat_r.eq(slave.dat_r[i*dw_from:(i+1)*dw_from]),
         ]
         self.comb += Case(master.adr[:int(log2(ratio))], cases)
 
-class Converter(Module):
+class Converter(LiteXModule):
     """Converter
 
     This module is a wrapper for DownConverter and UpConverter.
@@ -310,65 +624,173 @@ class Converter(Module):
     def __init__(self, master, slave):
         self.master = master
         self.slave = slave
+        # FIXME: Test/Remove byte addressing limitation.
+        if master.addressing != "word":
+            raise ValueError("Master must be word-addressed (byte addressing not supported).")
+        if slave.addressing != "word":
+            raise ValueError("Slave must be word-addressed (byte addressing not supported).")
 
         # # #
 
+        # Signals.
         dw_from = len(master.dat_r)
-        dw_to = len(slave.dat_r)
+        dw_to   = len(slave.dat_r)
+
+        # DownConverter.
         if dw_from > dw_to:
             downconverter = DownConverter(master, slave)
             self.submodules += downconverter
+        # UpConverter.
         elif dw_from < dw_to:
             upconverter = UpConverter(master, slave)
             self.submodules += upconverter
+        # Direct Connect.
         else:
             self.comb += master.connect(slave)
 
 # Wishbone SRAM ------------------------------------------------------------------------------------
 
-class SRAM(Module):
-    def __init__(self, mem_or_size, read_only=None, init=None, bus=None):
+class SRAM(LiteXModule):
+    autocsr_exclude = {"mem"}
+    def __init__(self, mem_or_size, read_only=None, write_only=None, init=None, bus=None, name=None):
+        # Resolve read_only first (it can be promoted from the Memory's bus_read_only attribute)
+        # so that the bus mode reflects the actual generated RTL.
+        if read_only is None:
+            if isinstance(mem_or_size, Memory) and hasattr(mem_or_size, "bus_read_only"):
+                read_only = mem_or_size.bus_read_only
+            else:
+                read_only = False
+        if read_only:
+            mode = "r"
+        elif write_only:
+            mode = "w"
+        else:
+            mode = "rw"
         if bus is None:
-            bus = Interface()
+            bus = Interface(data_width=32, address_width=32, addressing="word", mode=mode)
+        else:
+            bus.mode = mode
+            # FIXME: Test/Remove byte addressing limitation.
+            if bus.addressing != "word":
+                raise ValueError("Wishbone SRAM bus must be word-addressed (byte addressing not supported).")
         self.bus = bus
         bus_data_width = len(self.bus.dat_r)
         if isinstance(mem_or_size, Memory):
             assert(mem_or_size.width <= bus_data_width)
             self.mem = mem_or_size
         else:
-            self.mem = Memory(bus_data_width, mem_or_size//(bus_data_width//8), init=init)
-        if read_only is None:
-            if hasattr(self.mem, "bus_read_only"):
-                read_only = self.mem.bus_read_only
-            else:
-                read_only = False
+            self.mem = Memory(bus_data_width, mem_or_size//(bus_data_width//8), init=init, name=name)
+        if not read_only and (self.mem.width % 8):
+            raise ValueError("Writable Wishbone SRAM memory width must be a multiple of 8 bits.")
 
-        ###
+        # # #
 
-        # memory
-        port = self.mem.get_port(write_capable=not read_only, we_granularity=8,
-            mode=READ_FIRST if read_only else WRITE_FIRST)
+        adr_burst = Signal()
+
+        # Burst support.
+        # --------------
+
+        if self.bus.bursting:
+            adr_wrap_mask = Array((0b0000, 0b0011, 0b0111, 0b1111))
+            adr_wrap_max  = adr_wrap_mask[-1].bit_length()
+
+            adr_burst_wrap = Signal()
+            adr_latched    = Signal()
+
+            adr_counter        = Signal(len(self.bus.adr))
+            adr_counter_base   = Signal(len(self.bus.adr))
+            adr_counter_offset = Signal(adr_wrap_max)
+            adr_offset_lsb     = Signal(adr_wrap_max)
+            adr_offset_msb     = Signal(len(self.bus.adr))
+
+            adr_next = Signal(len(self.bus.adr))
+
+            # Only Incrementing Burts are supported.
+            self.comb += [
+                Case(self.bus.cti, {
+                    # incrementing address burst cycle
+                    CTI_BURST_INCREMENTING: adr_burst.eq(1),
+                    # end current burst cycle
+                    CTI_BURST_END: adr_burst.eq(0),
+                    # unsupported burst cycle
+                    "default": adr_burst.eq(0)
+                }),
+                adr_burst_wrap.eq(self.bus.bte[0] | self.bus.bte[1]),
+                adr_counter_base.eq(
+                    Cat(self.bus.adr & ~adr_wrap_mask[self.bus.bte],
+                       self.bus.adr[adr_wrap_max:]
+                    )
+                )
+            ]
+
+            # Latch initial address (without wrapping bits and wrap offset).
+            self.sync += [
+                If(self.bus.cyc & self.bus.stb & adr_burst,
+                    adr_latched.eq(1),
+                    # Latch initial address, then increment it every clock cycle
+                    If(adr_latched,
+                        adr_counter.eq(adr_counter + 1)
+                    ).Else(
+                        adr_counter_offset.eq(self.bus.adr & adr_wrap_mask[self.bus.bte]),
+                        adr_counter.eq(adr_counter_base +
+                            Cat(~self.bus.we, Replicate(0, len(adr_counter)-1))
+                        )
+                    ),
+                    If(self.bus.cti == CTI_BURST_END,
+                        adr_latched.eq(0),
+                        adr_counter.eq(0),
+                        adr_counter_offset.eq(0)
+                    )
+                ).Else(
+                    adr_latched.eq(0),
+                    adr_counter.eq(0),
+                    adr_counter_offset.eq(0)
+                ),
+            ]
+
+            # Next Address = counter value without wrapped bits + wrapped counter bits with offset.
+            self.comb += [
+                adr_offset_lsb.eq((adr_counter + adr_counter_offset) & adr_wrap_mask[self.bus.bte]),
+                adr_offset_msb.eq(adr_counter & ~adr_wrap_mask[self.bus.bte]),
+                adr_next.eq(adr_offset_msb + adr_offset_lsb)
+            ]
+
+        # # #
+
+        # Memory.
+        # -------
+        port = self.mem.get_port(
+            write_capable  = not read_only,
+            we_granularity = 8,
+            mode           = READ_FIRST if read_only else WRITE_FIRST,
+        )
         self.specials += self.mem, port
-        # generate write enable signal
+        # Generate write enable signal
         if not read_only:
             self.comb += [port.we[i].eq(self.bus.cyc & self.bus.stb & self.bus.we & self.bus.sel[i])
-                for i in range(bus_data_width//8)]
-        # address and data
-        self.comb += [
-            port.adr.eq(self.bus.adr[:len(port.adr)]),
-            self.bus.dat_r.eq(port.dat_r)
-        ]
+                for i in range(self.mem.width//8)]
+        # Address and data
+        self.comb += port.adr.eq(self.bus.adr[:len(port.adr)])
+        if self.bus.bursting:
+            self.comb += If(adr_burst & adr_latched,
+                port.adr.eq(adr_next[:len(port.adr)]),
+            )
+
+        if not write_only:
+            self.comb += self.bus.dat_r.eq(port.dat_r)
+
         if not read_only:
-            self.comb += port.dat_w.eq(self.bus.dat_w),
-        # generate ack
+            self.comb += port.dat_w.eq(self.bus.dat_w)
+
+        # Generate Ack.
         self.sync += [
             self.bus.ack.eq(0),
-            If(self.bus.cyc & self.bus.stb & ~self.bus.ack, self.bus.ack.eq(1))
+            If(self.bus.cyc & self.bus.stb & (~self.bus.ack | adr_burst), self.bus.ack.eq(1))
         ]
 
 # Wishbone To CSR ----------------------------------------------------------------------------------
 
-class Wishbone2CSR(Module):
+class Wishbone2CSR(LiteXModule):
     def __init__(self, bus_wishbone=None, bus_csr=None, register=True):
         self.csr = bus_csr
         if self.csr is None:
@@ -379,79 +801,172 @@ class Wishbone2CSR(Module):
             # If no Wishbone bus provided, create it with default parameters.
             self.wishbone = Interface()
 
+        wishbone_data_width = self.wishbone.data_width
+        csr_data_width      = self.csr.data_width
+        if wishbone_data_width < csr_data_width:
+            raise ValueError("Wishbone data width must be >= CSR data width.")
+        if (wishbone_data_width % csr_data_width) != 0:
+            raise ValueError("Wishbone data width must be a multiple of CSR data width.")
+        if (self.csr.alignment % csr_data_width) != 0:
+            raise ValueError("CSR alignment must be a multiple of CSR data width.")
+
         # # #
 
+        ratio               = wishbone_data_width//csr_data_width
+        csr_bytes           = csr_data_width//8
+        wishbone_bytes      = wishbone_data_width//8
+        csr_alignment_bytes = self.csr.alignment//8
+
+        selected = Signal(max=max(2, ratio))
+        self.comb += selected.eq(0)
+        for i in reversed(range(ratio)):
+            self.comb += If(self.wishbone.sel[i*csr_bytes:(i + 1)*csr_bytes] != 0,
+                selected.eq(i)
+            )
+
+        def get_csr_adr():
+            # Convert Wishbone addresses to CSR alignment units. CSR addresses are expressed in
+            # CONFIG_CSR_ALIGNMENT-sized slots, independently of the CSR subregister data width.
+            if self.wishbone.addressing == "byte":
+                return self.wishbone.adr[log2_int(csr_alignment_bytes):]
+            if wishbone_bytes >= csr_alignment_bytes:
+                alignment_slots = wishbone_bytes//csr_alignment_bytes
+                if alignment_slots == 1:
+                    return self.wishbone.adr
+                selected_alignment = Signal(max=alignment_slots)
+                self.comb += selected_alignment.eq(
+                    selected >> log2_int(csr_alignment_bytes//csr_bytes))
+                return Cat(selected_alignment, self.wishbone.adr)
+            else:
+                return self.wishbone.adr[log2_int(csr_alignment_bytes//wishbone_bytes):]
+
+        csr_adr = get_csr_adr()
+        dat_ws  = Array(
+            self.wishbone.dat_w[i*csr_data_width:(i + 1)*csr_data_width]
+            for i in range(ratio)
+        )
+        selected_r = Signal(max=max(2, ratio))
+
+        # Registered Access.
         if register:
-            fsm = FSM(reset_state="IDLE")
-            self.submodules += fsm
+            self.fsm = fsm = FSM(reset_state="IDLE")
             fsm.act("IDLE",
-                NextValue(self.csr.dat_w, self.wishbone.dat_w),
+                NextValue(self.csr.dat_w, dat_ws[selected]),
                 If(self.wishbone.cyc & self.wishbone.stb,
-                    NextValue(self.csr.adr, self.wishbone.adr),
-                    NextValue(self.csr.we, self.wishbone.we & (self.wishbone.sel != 0)),
+                    NextValue(selected_r, selected),
+                    NextValue(self.csr.adr, csr_adr),
+                    NextValue(self.csr.re, ~self.wishbone.we & (self.wishbone.sel != 0)),
+                    NextValue(self.csr.we,  self.wishbone.we & (self.wishbone.sel != 0)),
                     NextState("WRITE-READ")
                 )
             )
             fsm.act("WRITE-READ",
                 NextValue(self.csr.adr, 0),
+                NextValue(self.csr.re, 0),
                 NextValue(self.csr.we, 0),
                 NextState("ACK")
             )
             fsm.act("ACK",
                 self.wishbone.ack.eq(1),
-                self.wishbone.dat_r.eq(self.csr.dat_r),
+                self.wishbone.dat_r.eq(0),
+                Case(selected_r, {
+                    i: self.wishbone.dat_r[
+                        i*csr_data_width:(i + 1)*csr_data_width
+                    ].eq(self.csr.dat_r)
+                    for i in range(ratio)
+                }),
                 NextState("IDLE")
             )
+        # Un-Registered Access.
         else:
-            fsm = FSM(reset_state="WRITE-READ")
-            self.submodules += fsm
+            self.fsm = fsm = FSM(reset_state="WRITE-READ")
             fsm.act("WRITE-READ",
-                self.csr.dat_w.eq(self.wishbone.dat_w),
+                self.csr.dat_w.eq(dat_ws[selected]),
                 If(self.wishbone.cyc & self.wishbone.stb,
-                    self.csr.adr.eq(self.wishbone.adr),
-                    self.csr.we.eq(self.wishbone.we & (self.wishbone.sel != 0)),
+                    self.csr.adr.eq(csr_adr),
+                    self.csr.re.eq(~self.wishbone.we & (self.wishbone.sel != 0)),
+                    self.csr.we.eq( self.wishbone.we & (self.wishbone.sel != 0)),
                     NextState("ACK")
                 )
             )
             fsm.act("ACK",
                 self.wishbone.ack.eq(1),
-                self.wishbone.dat_r.eq(self.csr.dat_r),
+                self.wishbone.dat_r.eq(0),
+                Case(selected, {
+                    i: self.wishbone.dat_r[
+                        i*csr_data_width:(i + 1)*csr_data_width
+                    ].eq(self.csr.dat_r)
+                    for i in range(ratio)
+                }),
                 NextState("WRITE-READ")
             )
 
 # Wishbone Cache -----------------------------------------------------------------------------------
 
-class Cache(Module):
+class Cache(LiteXModule):
     """Cache
 
-    This module is a write-back wishbone cache that can be used as a L2 cache.
-    Cachesize (in 32-bit words) is the size of the data store and must be a power of 2
+    This module is a write-back wishbone cache that can be used as a L2 cache. Cachesize (in 32-bit
+    words) is the size of the data store and must be a power of 2.
+    With with_bursting, read bursts can acknowledge consecutive lanes of a wider slave word on
+    consecutive cycles. Equal/narrower slave widths retain the normal hit path.
+    With with_refill_bypass, read misses can acknowledge directly from an equal/wider slave's
+    refill response; this adds a combinational path from slave data/ack to the master.
     """
-    def __init__(self, cachesize, master, slave, reverse=True):
+    def __init__(self, cachesize, master, slave, reverse=True,
+        with_bursting=False, with_refill_bypass=False):
         self.master = master
-        self.slave = slave
+        self.slave  = slave
 
         # # #
 
+        # Parameters.
+        # -----------
         dw_from = len(master.dat_r)
-        dw_to = len(slave.dat_r)
+        dw_to   = len(slave.dat_r)
         if dw_to > dw_from and (dw_to % dw_from) != 0:
             raise ValueError("Slave data width must be a multiple of {dw}".format(dw=dw_from))
         if dw_to < dw_from and (dw_from % dw_to) != 0:
             raise ValueError("Master data width must be a multiple of {dw}".format(dw=dw_to))
+        # The address split below assumes word addressing on both sides.
+        if master.addressing != "word":
+            raise ValueError("Cache master must be word-addressed (byte addressing not supported).")
+        if slave.addressing != "word":
+            raise ValueError("Cache slave must be word-addressed (byte addressing not supported).")
 
-        # Split address:
-        # TAG | LINE NUMBER | LINE OFFSET
-        offsetbits = log2_int(max(dw_to//dw_from, 1))
-        addressbits = len(slave.adr) + offsetbits
-        linebits = log2_int(cachesize) - offsetbits
-        tagbits = addressbits - linebits
-        wordbits = log2_int(max(dw_from//dw_to, 1))
+        # Bypass.
+        # -------
+        if cachesize == 0:
+            if dw_to != dw_from:
+                raise ValueError("Cache bypass (cachesize=0) requires equal Master/Slave data widths "
+                                 "({} vs {}), use a Converter.".format(dw_from, dw_to))
+            self.comb += master.connect(slave)
+            return
+
+        # Address Split.
+        # --------------
+        # TAG | LINE NUMBER | LINE OFFSET.
+        offsetbits                    = log2_int(max(dw_to//dw_from, 1))
+        addressbits                   = len(slave.adr) + offsetbits
+        linebits                      = log2_int(cachesize*32) - log2_int(max(dw_from, dw_to))
+        tagbits                       = addressbits - linebits
+        wordbits                      = log2_int(max(dw_from//dw_to, 1))
         adr_offset, adr_line, adr_tag = split(master.adr, offsetbits, linebits, tagbits)
-        word = Signal(wordbits) if wordbits else None
+        word                          = Signal(wordbits) if wordbits else None
 
-        # Data memory
-        data_mem = Memory(dw_to*2**wordbits, 2**linebits)
+        # A wide data-memory word already contains several CPU words. During a
+        # read burst, select the live lane without another synchronous RAM read.
+        # Check the registered RAM index as well as the tag: an address change
+        # must never acknowledge data left over from the previous cache line.
+        bursting = with_bursting and offsetbits != 0
+        read_burst = (master.cti == CTI_BURST_INCREMENTING) | (master.cti == CTI_BURST_CONSTANT)
+        if bursting:
+            adr_line_r = Signal.like(adr_line)
+            self.sync += adr_line_r.eq(adr_line)
+
+        # Data Memory.
+        # ------------
+        data_mem  = Memory(dw_to*2**wordbits, 2**linebits)
         data_port = data_mem.get_port(write_capable=True, we_granularity=8)
         self.specials += data_mem, data_port
 
@@ -461,6 +976,22 @@ class Cache(Module):
         else:
             adr_offset_r = Signal(offsetbits, reset_less=True)
             self.sync += adr_offset_r.eq(adr_offset)
+
+        read_offset = adr_offset_r
+        if bursting:
+            # Share the cache-data lane mux between normal and burst hits.
+            # Switching a small lane index costs less than duplicating the
+            # wide-word mux and then selecting between two complete CPU words.
+            read_offset = Signal(offsetbits)
+            self.comb += read_offset.eq(adr_offset_r)
+
+        read_data = data_port.dat_r
+        if with_refill_bypass and dw_to >= dw_from:
+            # Both sources use the same lane selection. Selecting the source
+            # before the lane mux avoids two independent wide-word selectors.
+            read_from_refill = Signal()
+            read_data = Signal.like(data_port.dat_r)
+            self.comb += read_data.eq(Mux(read_from_refill, slave.dat_r, data_port.dat_r))
 
         self.comb += [
             data_port.adr.eq(adr_line),
@@ -475,14 +1006,15 @@ class Cache(Module):
             ),
             chooser(data_port.dat_r, word, slave.dat_w),
             slave.sel.eq(2**(dw_to//8)-1),
-            chooser(data_port.dat_r, adr_offset_r, master.dat_r, reverse=reverse)
+            chooser(read_data, read_offset, master.dat_r, reverse=reverse)
         ]
 
 
-        # Tag memory
+        # Tag memory.
+        # -----------
         tag_layout = [("tag", tagbits), ("dirty", 1)]
-        tag_mem = Memory(layout_len(tag_layout), 2**linebits)
-        tag_port = tag_mem.get_port(write_capable=True)
+        tag_mem    = Memory(layout_len(tag_layout), 2**linebits)
+        tag_port   = tag_mem.get_port(write_capable=True)
         self.specials += tag_mem, tag_port
         tag_do = Record(tag_layout)
         tag_di = Record(tag_layout)
@@ -500,17 +1032,19 @@ class Cache(Module):
         else:
             self.comb += slave.adr.eq(Cat(adr_line, tag_do.tag))
 
-        # slave word computation, word_clr and word_inc will be simplified
-        # at synthesis when wordbits=0
+        # Slave word compute.
+        # -------------------
+        # word_clr and word_inc will be simplified at synthesis when wordbits=0.
         word_clr = Signal()
         word_inc = Signal()
         if word is not None:
-            self.sync += \
+            self.sync += [
                 If(word_clr,
                     word.eq(0),
                 ).Elif(word_inc,
                     word.eq(word+1)
                 )
+            ]
 
         def word_is_last(word):
             if word is not None:
@@ -518,8 +1052,28 @@ class Cache(Module):
             else:
                 return 1
 
-        # Control FSM
-        self.submodules.fsm = fsm = FSM(reset_state="IDLE")
+        # FSM.
+        # ----
+        self.fsm = fsm = FSM(reset_state="IDLE")
+        hit_next = [NextState("IDLE")]
+        if bursting:
+            hit_next = [If(~master.we & read_burst,
+                NextState("BURST")
+            ).Else(
+                NextState("IDLE")
+            )]
+        refill_next = [NextState("TEST_HIT")]
+        if with_refill_bypass and dw_to >= dw_from:
+            # The whole cache line arrives in this beat. Return the requested
+            # lane while filling RAM, avoiding the subsequent TEST_HIT cycle.
+            # Writes still need TEST_HIT to apply byte enables and mark dirty.
+            refill_next = [If(master.cyc & master.stb & ~master.we,
+                master.ack.eq(1),
+                read_from_refill.eq(1),
+                *hit_next,
+            ).Else(
+                NextState("TEST_HIT")
+            )]
         fsm.act("IDLE",
             If(master.cyc & master.stb,
                 NextState("TEST_HIT")
@@ -533,7 +1087,7 @@ class Cache(Module):
                     tag_di.dirty.eq(1),
                     tag_port.we.eq(1)
                 ),
-                NextState("IDLE")
+                *hit_next,
             ).Else(
                 If(tag_do.dirty,
                     NextState("EVICT")
@@ -545,6 +1099,23 @@ class Cache(Module):
                 )
             )
         )
+
+        if bursting:
+            fsm.act("BURST",
+                # Read data is only consumed with ACK, so lane selection need
+                # not depend on the tag/address/enable checks below.
+                read_offset.eq(adr_offset),
+                If(~master.cyc | ~master.stb,
+                    NextState("IDLE")
+                ).Elif(master.we | (adr_line != adr_line_r) | (tag_do.tag != adr_tag),
+                    # Let both synchronous memories catch up before testing the
+                    # next line, or using the normal byte-write/dirty-tag path.
+                    NextState("TEST_HIT")
+                ).Else(
+                    master.ack.eq(1),
+                    If(~read_burst, NextState("IDLE"))
+                )
+            )
 
         fsm.act("EVICT",
             slave.stb.eq(1),
@@ -568,7 +1139,7 @@ class Cache(Module):
                 write_from_slave.eq(1),
                 word_inc.eq(1),
                 If(word_is_last(word),
-                    NextState("TEST_HIT"),
+                    *refill_next,
                 ).Else(
                     NextState("REFILL")
                 )

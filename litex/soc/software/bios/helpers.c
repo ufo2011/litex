@@ -3,31 +3,65 @@
 // SPDX-License-Identifier: BSD-Source-Code
 
 #include <stdio.h>
-#include <console.h>
-#include <crc.h>
 #include <string.h>
+#include <stdint.h>
+
+#include <libbase/console.h>
+#include <libbase/crc.h>
 
 #include "readline.h"
 #include "helpers.h"
 #include "command.h"
+#include "init.h"
 
 extern unsigned int _ftext, _edata_rom;
 
+#define BIOS_SECTION_WIDTH 42
 #define NUMBER_OF_BYTES_ON_A_LINE 16
-void dump_bytes(unsigned int *ptr, int count, unsigned long addr)
-{
-	char *data = (char *)ptr;
-	int line_bytes = 0, i = 0;
 
-	putsnonl("Memory dump:");
+static void print_repeat(char c, int count)
+{
+	for (int i = 0; i < count; i++)
+		putchar(c);
+}
+
+void bios_print_section(const char *name)
+{
+	int fill = BIOS_SECTION_WIDTH - strlen(name) - 6;
+	int left = fill/2;
+	int right = fill - left;
+
+	printf("--");
+	print_repeat('=', left);
+	printf(" " ANSI_BOLD "%s" ANSI_RESET " ", name);
+	print_repeat('=', right);
+	printf("--\n");
+}
+
+void bios_print_status(const char *label, int success)
+{
+	printf("%s: %s\n", label, success ? "OK" : "failed");
+}
+
+void dump_bytes(unsigned int *ptr, unsigned int count, unsigned long addr)
+{
+	unsigned char *dptr = (unsigned char *)ptr;
+	unsigned char data[NUMBER_OF_BYTES_ON_A_LINE];
+	unsigned int line_bytes = 0, i = 0;
+
+
+	fputs("Memory dump:", stdout);
 	while (count > 0) {
-		line_bytes =
-			(count > NUMBER_OF_BYTES_ON_A_LINE)?
-				NUMBER_OF_BYTES_ON_A_LINE : count;
+			line_bytes =
+				(count > NUMBER_OF_BYTES_ON_A_LINE)?
+					NUMBER_OF_BYTES_ON_A_LINE : count;
+		for (i = 0; i < line_bytes; i++)
+			data[i] = *dptr++;
+
 
 		printf("\n0x%08lx  ", addr);
 		for (i = 0; i < line_bytes; i++)
-			printf("%02x ", *(unsigned char *)(data+i));
+			printf("%02x ", (unsigned char)data[i]);
 
 		for (; i < NUMBER_OF_BYTES_ON_A_LINE; i++)
 			printf("   ");
@@ -35,16 +69,15 @@ void dump_bytes(unsigned int *ptr, int count, unsigned long addr)
 		printf(" ");
 
 		for (i = 0; i<line_bytes; i++) {
-			if ((*(data+i) < 0x20) || (*(data+i) > 0x7e))
+			if ((data[i] < 0x20) || (data[i] > 0x7e))
 				printf(".");
 			else
-				printf("%c", *(data+i));
+				printf("%c", data[i]);
 		}
 
 		for (; i < NUMBER_OF_BYTES_ON_A_LINE; i++)
 			printf(" ");
 
-		data += (char)line_bytes;
 		count -= line_bytes;
 		addr += line_bytes;
 	}
@@ -84,6 +117,9 @@ int get_param(char *buf, char **cmd, char **params)
 	for (i = 0; i < MAX_PARAM; i++)
 		params[i] = NULL;
 
+	while ((*buf == ' ') && (*buf != 0))
+		buf++;
+
 	*cmd = buf;
 
 	while ((*buf != ' ') && (*buf !=0))
@@ -102,6 +138,11 @@ int get_param(char *buf, char **cmd, char **params)
 		if (*buf == 0)
 			return nb_param;
 
+		if (nb_param >= MAX_PARAM) {
+			printf("Error: too many parameters (max %d)\n", MAX_PARAM);
+			return -1;
+		}
+
 		params[nb_param++] = buf;
 
 		while ((*buf != ' ') && (*buf !=0))
@@ -113,16 +154,27 @@ int get_param(char *buf, char **cmd, char **params)
 	}
 }
 
-struct command_struct *command_dispatcher(char *command, int nb_params, char **params)
+const struct command_struct *command_dispatcher(char *command, int nb_params, char **params)
 {
-	struct command_struct * const *cmd;
+	const struct command_struct * const *cmd;
 
 	for (cmd = __bios_cmd_start; cmd != __bios_cmd_end; cmd++) {
 		if (!strcmp(command, (*cmd)->name)) {
+			if (nb_params < (*cmd)->min_args || nb_params > (*cmd)->max_args) {
+				printf("Usage: %s\n", (*cmd)->usage ? (*cmd)->usage : (*cmd)->name);
+				return *cmd;
+			}
 			(*cmd)->func(nb_params, params);
 			return (*cmd);
 		}
 	}
 
 	return NULL;
+}
+
+void init_dispatcher(void)
+{
+	for (const init_func* fp = __bios_init_start; fp != __bios_init_end; fp++) {
+		(*fp)();
+	}
 }

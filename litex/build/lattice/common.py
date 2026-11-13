@@ -25,7 +25,8 @@ class LatticeECP5AsyncResetSynchronizerImpl(Module):
                 i_D  = 0,
                 i_PD = async_reset,
                 i_CK = cd.clk,
-                o_Q  = rst1),
+                o_Q  = rst1
+            ),
             Instance("FD1S3BX",
                 i_D  = rst1,
                 i_PD = async_reset,
@@ -44,13 +45,14 @@ class LatticeECP5AsyncResetSynchronizer:
 
 class LatticeECP5SDRInputImpl(Module):
     def __init__(self, i, o, clk):
-        self.specials += Instance("IFS1P3BX",
-            i_SCLK = clk,
-            i_PD   = 0,
-            i_SP   = 1,
-            i_D    = i,
-            o_Q    = o,
-        )
+        for j in range(len(i)):
+            self.specials += Instance("IFS1P3BX",
+                i_SCLK = clk,
+                i_PD   = 0,
+                i_SP   = 1,
+                i_D    = i[j],
+                o_Q    = o[j],
+            )
 
 class LatticeECP5SDRInput:
     @staticmethod
@@ -61,13 +63,14 @@ class LatticeECP5SDRInput:
 
 class LatticeECP5SDROutputImpl(Module):
     def __init__(self, i, o, clk):
-        self.specials += Instance("OFS1P3BX",
-            i_SCLK = clk,
-            i_PD   = 0,
-            i_SP   = 1,
-            i_D    = i,
-            o_Q    = o,
-        )
+        for j in range(len(o)):
+            self.specials += Instance("OFS1P3BX",
+                i_SCLK = clk,
+                i_PD   = 0,
+                i_SP   = 1,
+                i_D    = i[j],
+                o_Q    = o[j],
+            )
 
 class LatticeECP5SDROutput:
     @staticmethod
@@ -78,12 +81,13 @@ class LatticeECP5SDROutput:
 
 class LatticeECP5DDRInputImpl(Module):
     def __init__(self, i, o1, o2, clk):
-        self.specials += Instance("IDDRX1F",
-            i_SCLK = clk,
-            i_D    = i,
-            o_Q0   = o1,
-            o_Q1   = o2,
-        )
+        for j in range(len(i)):
+            self.specials += Instance("IDDRX1F",
+                i_SCLK = clk,
+                i_D    = i[j],
+                o_Q0   = o1[j],
+                o_Q1   = o2[j],
+            )
 
 class LatticeECP5DDRInput:
     @staticmethod
@@ -94,12 +98,13 @@ class LatticeECP5DDRInput:
 
 class LatticeECP5DDROutputImpl(Module):
     def __init__(self, i1, i2, o, clk):
-        self.specials += Instance("ODDRX1F",
-            i_SCLK = clk,
-            i_D0   = i1,
-            i_D1   = i2,
-            o_Q    = o,
-        )
+        for j in range(len(o)):
+            self.specials += Instance("ODDRX1F",
+                i_SCLK = clk,
+                i_D0   = i1[j],
+                i_D1   = i2[j],
+                o_Q    = o[j] ,
+            )
 
 class LatticeECP5DDROutput:
     @staticmethod
@@ -111,9 +116,9 @@ class LatticeECP5DDROutput:
 class LatticeECP5DifferentialInputImpl(Module):
     def __init__(self, i_p, i_n, o):
         self.specials += Instance("ILVDS",
-            i_A=i_p,
-            i_AN=i_n,
-            o_Z=o,
+            i_A  = i_p,
+            i_AN = i_n,
+            o_Z  = o,
         )
 
 class LatticeECP5DifferentialInput:
@@ -121,15 +126,52 @@ class LatticeECP5DifferentialInput:
     def lower(dr):
         return LatticeECP5DifferentialInputImpl(dr.i_p, dr.i_n, dr.o)
 
+# ECP5 Differential Output -------------------------------------------------------------------------
+
+class LatticeECP5DifferentialOutputImpl(Module):
+    def __init__(self, i, o_p, o_n):
+        self.specials += Instance("OLVDS",
+            i_A  = i,
+            o_Z  = o_p,
+            o_ZN = o_n,
+        )
+
+class LatticeECP5DifferentialOutput:
+    @staticmethod
+    def lower(dr):
+        return LatticeECP5DifferentialOutputImpl(dr.i, dr.o_p, dr.o_n)
+
+# ECP5 Special Tristate ----------------------------------------------------------------------------
+
+class LatticeECP5TristateImpl(Module):
+    def __init__(self, io, o, oe, i):
+        nbits, sign = value_bits_sign(io)
+        if i is None:
+            i = Signal().like(o)
+        for bit in range(nbits):
+            self.specials += Instance("BB",
+                io_B  = io[bit] if nbits > 1 else io,
+                i_I   = o[bit]  if nbits > 1 else o,
+                o_O   = i[bit]  if nbits > 1 else i,
+                i_T   = ~oe[bit] if len(oe) == nbits > 1 else ~oe
+            )
+
+class LatticeECP5Tristate(Module):
+    @staticmethod
+    def lower(dr):
+        return LatticeECP5TristateImpl(dr.target, dr.o, dr.oe, dr.i)
+
 # ECP5 Special Overrides ---------------------------------------------------------------------------
 
 lattice_ecp5_special_overrides = {
     AsyncResetSynchronizer: LatticeECP5AsyncResetSynchronizer,
+    Tristate:               LatticeECP5Tristate,
     SDRInput:               LatticeECP5SDRInput,
     SDROutput:              LatticeECP5SDROutput,
     DDRInput:               LatticeECP5DDRInput,
     DDROutput:              LatticeECP5DDROutput,
     DifferentialInput:      LatticeECP5DifferentialInput,
+    DifferentialOutput:     LatticeECP5DifferentialOutput,
 }
 
 # ECP5 Trellis Tristate ----------------------------------------------------------------------------
@@ -137,19 +179,47 @@ lattice_ecp5_special_overrides = {
 class LatticeECP5TrellisTristateImpl(Module):
     def __init__(self, io, o, oe, i):
         nbits, sign = value_bits_sign(io)
+        if i is None:
+            i = Signal().like(o)
         for bit in range(nbits):
             self.specials += Instance("TRELLIS_IO",
                 p_DIR = "BIDIR",
                 i_B   = io[bit] if nbits > 1 else io,
                 i_I   = o[bit]  if nbits > 1 else o,
                 o_O   = i[bit]  if nbits > 1 else i,
-                i_T   = ~oe
+                i_T   = ~oe[bit] if len(oe) == nbits > 1 else ~oe
             )
 
 class LatticeECP5TrellisTristate(Module):
     @staticmethod
     def lower(dr):
         return LatticeECP5TrellisTristateImpl(dr.target, dr.o, dr.oe, dr.i)
+
+# ECP5 Trellis SDR Tristate ----------------------------------------------------------------------------
+
+class LatticeECP5TrellisSDRTristateImpl(Module):
+    def __init__(self, io, o, oe, i, clk):
+        _o    = Signal().like(o)
+        _oe_n = Signal().like(oe)
+        _i    = Signal().like(i if i is not None else o)
+        self.specials += SDROutput(o, _o, clk)
+        self.specials += SDROutput(~oe, _oe_n, clk)
+        if i is not None:
+            self.specials += SDRInput(_i, i, clk)
+        for j in range(len(io)):
+            self.specials += Instance("TRELLIS_IO",
+                p_DIR = "BIDIR",
+                i_B   = io[j],
+                i_I   = _o[j],
+                o_O   = _i[j],
+                i_T   = _oe_n[j],
+            )
+
+class LatticeECP5TrellisSDRTristate:
+    @staticmethod
+    def lower(dr):
+        return LatticeECP5TrellisSDRTristateImpl(dr.io, dr.o, dr.oe, dr.i, dr.clk)
+
 
 # ECP5 Trellis Special Overrides -------------------------------------------------------------------
 
@@ -158,9 +228,11 @@ lattice_ecp5_trellis_special_overrides = {
     Tristate:               LatticeECP5TrellisTristate,
     SDRInput:               LatticeECP5SDRInput,
     SDROutput:              LatticeECP5SDROutput,
+    SDRTristate:            LatticeECP5TrellisSDRTristate,
     DDRInput:               LatticeECP5DDRInput,
     DDROutput:              LatticeECP5DDROutput,
     DifferentialInput:      LatticeECP5DifferentialInput,
+    DifferentialOutput:     LatticeECP5DifferentialOutput,
 }
 
 
@@ -175,7 +247,8 @@ class LatticeNXsyncResetSynchronizerImpl(Module):
                 i_PD = async_reset,
                 i_CK = cd.clk,
                 i_SP = 1,
-                o_Q  = rst1),
+                o_Q  = rst1
+            ),
             Instance("FD1P3BX",
                 i_D  = rst1,
                 i_PD = async_reset,
@@ -195,13 +268,14 @@ class LatticeNXAsyncResetSynchronizer:
 
 class LatticeNXSDRInputImpl(Module):
     def __init__(self, i, o, clk):
-        self.specials += Instance("IFD1P3BX",
-            i_SCLK = clk,
-            i_PD   = 0,
-            i_SP   = 1,
-            i_D    = i,
-            o_Q    = o,
-        )
+        for j in range(len(i)):
+            self.specials += Instance("IFD1P3BX",
+                i_CK = clk,
+                i_PD   = 0,
+                i_SP   = 1,
+                i_D    = i[j],
+                o_Q    = o[j],
+            )
 
 class LatticeNXSDRInput:
     @staticmethod
@@ -212,29 +286,57 @@ class LatticeNXSDRInput:
 
 class LatticeNXSDROutputImpl(Module):
     def __init__(self, i, o, clk):
-        self.specials += Instance("OFD1P3BX",
-            i_SCLK = clk,
-            i_PD   = 0,
-            i_SP   = 1,
-            i_D    = i,
-            o_Q    = o,
-        )
+        for j in range(len(o)):
+            self.specials += Instance("OFD1P3BX",
+                i_CK = clk,
+                i_PD   = 0,
+                i_SP   = 1,
+                i_D    = i[j],
+                o_Q    = o[j],
+            )
 
 class LatticeNXSDROutput:
     @staticmethod
     def lower(dr):
         return LatticeNXSDROutputImpl(dr.i, dr.o, dr.clk)
 
+# NX SDR Input and Output via regular flip-flops ---------------------------------------------------
+
+# This is a workaround for IO-specific primitives IFD1P3BX / OFD1P3BX being unsupported in nextpnr:
+# https://github.com/YosysHQ/nextpnr/issues/698
+
+class LatticeNXSDRFFImpl(Module):
+    def __init__(self, i, o, clk):
+        for j in range(len(o)):
+            self.specials += Instance("FD1P3BX",
+                i_CK = clk,
+                i_PD   = 0,
+                i_SP   = 1,
+                i_D    = i[j],
+                o_Q    = o[j],
+            )
+
+class LatticeNXSDRInputViaFlipFlop:
+    @staticmethod
+    def lower(dr):
+        return LatticeNXSDRFFImpl(dr.i, dr.o, dr.clk)
+
+class LatticeNXSDROutputViaFlipFlop:
+    @staticmethod
+    def lower(dr):
+        return LatticeNXSDRFFImpl(dr.i, dr.o, dr.clk)
+
 # NX DDR Input -------------------------------------------------------------------------------------
 
 class LatticeNXDDRInputImpl(Module):
     def __init__(self, i, o1, o2, clk):
-        self.specials += Instance("IDDRX1",
-            i_SCLK = clk,
-            i_D    = i,
-            o_Q0   = o1,
-            o_Q1   = o2,
-        )
+        for j in range(len(i)):
+            self.specials += Instance("IDDRX1",
+                i_SCLK = clk,
+                i_D    = i[j],
+                o_Q0   = o1[j],
+                o_Q1   = o2[j],
+            )
 
 class LatticeNXDDRInput:
     @staticmethod
@@ -245,17 +347,41 @@ class LatticeNXDDRInput:
 
 class LatticeNXDDROutputImpl(Module):
     def __init__(self, i1, i2, o, clk):
-        self.specials += Instance("ODDRX1",
-            i_SCLK = clk,
-            i_D0   = i1,
-            i_D1   = i2,
-            o_Q    = o,
-        )
+        for j in range(len(o)):
+            self.specials += Instance("ODDRX1",
+                i_SCLK = clk,
+                i_D0   = i1[j],
+                i_D1   = i2[j],
+                o_Q    = o[j] ,
+            )
 
 class LatticeNXDDROutput:
     @staticmethod
     def lower(dr):
         return LatticeNXDDROutputImpl(dr.i1, dr.i2, dr.o, dr.clk)
+
+# NX DDR Tristate ----------------------------------------------------------------------------------
+
+class LatticeNXDDRTristateImpl(Module):
+    def __init__(self, io, o1, o2, oe1, oe2, i1, i2, clk, i_async):
+        assert oe2 is None
+        _o  = Signal().like(o1)
+        _oe = Signal().like(oe1)
+        _i  = Signal().like(_o) if (i1 is not None and i2 is not None) or i_async is not None else None
+        self.specials += DDROutput(o1, o2, _o, clk)
+        self.specials += SDROutput(oe1, _oe, clk)
+        if _i is not None:
+            if i1 is not None and i2 is not None:
+                self.specials += DDRInput(_i, i1, i2, clk)
+            if i_async is not None:
+                self.comb += i_async.eq(_i)
+        self.specials += Tristate(io, _o, _oe, _i)
+        _oe.attr.add("syn_useioff")
+
+class LatticeNXDDRTristate:
+    @staticmethod
+    def lower(dr):
+        return LatticeNXDDRTristateImpl(dr.io, dr.o1, dr.o2, dr.oe1, dr.oe2, dr.i1, dr.i2, dr.clk, dr.i_async)
 
 # NX Special Overrides -----------------------------------------------------------------------------
 
@@ -265,7 +391,14 @@ lattice_NX_special_overrides = {
     SDROutput:              LatticeNXSDROutput,
     DDRInput:               LatticeNXDDRInput,
     DDROutput:              LatticeNXDDROutput,
+    DDRTristate:            LatticeNXDDRTristate,
 }
+
+lattice_NX_special_overrides_for_oxide = dict(lattice_NX_special_overrides)
+lattice_NX_special_overrides_for_oxide.update({
+    SDRInput:               LatticeNXSDRInputViaFlipFlop,
+    SDROutput:              LatticeNXSDROutputViaFlipFlop,
+})
 
 # iCE40 AsyncResetSynchronizer ---------------------------------------------------------------------
 
@@ -277,12 +410,14 @@ class LatticeiCE40AsyncResetSynchronizerImpl(Module):
                 i_D = 0,
                 i_S = async_reset,
                 i_C = cd.clk,
-                o_Q = rst1),
+                o_Q = rst1
+            ),
             Instance("SB_DFFS",
                 i_D = rst1,
                 i_S = async_reset,
                 i_C = cd.clk,
-                o_Q = cd.rst)
+                o_Q = cd.rst
+            )
         ]
 
 
@@ -296,11 +431,13 @@ class LatticeiCE40AsyncResetSynchronizer:
 class LatticeiCE40TristateImpl(Module):
     def __init__(self, io, o, oe, i):
         nbits, sign = value_bits_sign(io)
+        if i is None:
+            i = Signal().like(o)
         for bit in range(nbits):
             self.specials += Instance("SB_IO",
                 p_PIN_TYPE      = C(0b101001, 6), # PIN_OUTPUT_TRISTATE + PIN_INPUT
                 io_PACKAGE_PIN  = io[bit] if nbits > 1 else io,
-                i_OUTPUT_ENABLE = oe,
+                i_OUTPUT_ENABLE = oe[bit] if len(oe) == nbits > 1 else oe,
                 i_D_OUT_0       = o[bit]  if nbits > 1 else o,
                 o_D_IN_0        = i[bit]  if nbits > 1 else i,
             )
@@ -334,20 +471,44 @@ class LatticeiCE40DifferentialOutput:
     def lower(dr):
         return LatticeiCE40DifferentialOutputImpl(dr.i, dr.o_p, dr.o_n)
 
+# iCE40 Differential Input -------------------------------------------------------------------------
+
+class LatticeiCE40DifferentialInputImpl(Module):
+    def __init__(self, i_p, o):
+        self.specials += [
+            Instance("SB_IO",
+                p_PIN_TYPE     = C(0b000001, 6), # PIN_INPUT
+                p_IO_STANDARD  = "SB_LVDS_INPUT",
+                p_PULLUP       = C(0b0, 1),
+                p_NEG_TRIGGER  = C(0b0, 1),
+                io_PACKAGE_PIN = i_p,
+                o_D_IN_0       = o,
+                i_OUTPUT_ENABLE= C(0b1, 1)
+            ),
+            # according to https://www.latticesemi.com/support/answerdatabase/6/1/6/6161 the n pin
+            # will get assigned to the LVDS input automatically
+        ]
+
+class LatticeiCE40DifferentialInput:
+    @staticmethod
+    def lower(dr):
+        return LatticeiCE40DifferentialInputImpl(dr.i_p, dr.o)
+
 # iCE40 DDR Output ---------------------------------------------------------------------------------
 
 class LatticeiCE40DDROutputImpl(Module):
     def __init__(self, i1, i2, o, clk):
-        self.specials += Instance("SB_IO",
-            p_PIN_TYPE      = C(0b010000, 6), # PIN_OUTPUT_DDR
-            p_IO_STANDARD   = "SB_LVCMOS",
-            io_PACKAGE_PIN  = o,
-            i_CLOCK_ENABLE  = 1,
-            i_OUTPUT_CLK    = clk,
-            i_OUTPUT_ENABLE = 1,
-            i_D_OUT_0       = i1,
-            i_D_OUT_1       = i2
-        )
+        for j in range(len(o)):
+            self.specials += Instance("SB_IO",
+                p_PIN_TYPE      = C(0b010000, 6), # PIN_OUTPUT_DDR
+                p_IO_STANDARD   = "SB_LVCMOS",
+                io_PACKAGE_PIN  = o[j],
+                i_CLOCK_ENABLE  = 1,
+                i_OUTPUT_CLK    = clk,
+                i_OUTPUT_ENABLE = 1,
+                i_D_OUT_0       = i1[j],
+                i_D_OUT_1       = i2[j]
+            )
 
 
 class LatticeiCE40DDROutput:
@@ -359,15 +520,16 @@ class LatticeiCE40DDROutput:
 
 class LatticeiCE40DDRInputImpl(Module):
     def __init__(self, i, o1, o2, clk):
-        self.specials += Instance("SB_IO",
-            p_PIN_TYPE      = C(0b000000, 6),  # PIN_INPUT_DDR
-            p_IO_STANDARD   = "SB_LVCMOS",
-            io_PACKAGE_PIN  = i,
-            i_CLOCK_ENABLE  = 1,
-            i_INPUT_CLK     = clk,
-            o_D_IN_0        = o1,
-            o_D_IN_1        = o2
-        )
+        for j in range(len(i)):
+            self.specials += Instance("SB_IO",
+                p_PIN_TYPE      = C(0b000000, 6),  # PIN_INPUT_DDR
+                p_IO_STANDARD   = "SB_LVCMOS",
+                io_PACKAGE_PIN  = i[j],
+                i_CLOCK_ENABLE  = 1,
+                i_INPUT_CLK     = clk,
+                o_D_IN_0        = o1[j],
+                o_D_IN_1        = o2[j]
+            )
 
 
 class LatticeiCE40DDRInput:
@@ -375,19 +537,75 @@ class LatticeiCE40DDRInput:
     def lower(dr):
         return LatticeiCE40DDRInputImpl(dr.i, dr.o1, dr.o2, dr.clk)
 
+# iCE40 DDR Tristate -------------------------------------------------------------------------------
+
+class LatticeiCE40DDRTristateImpl(Module):
+    def __init__(self, io, o1, o2, oe1, oe2, i1, i2, clk, i_async):
+        if oe2 is not None:
+            raise ValueError("iCE40 DDRTristate does not support DDR output enable")
+
+        for j in range(len(io)):
+            parameters = dict(
+                p_PIN_TYPE      = C(0b110000, 6), # PIN_OUTPUT_DDR_REGISTERED_ENABLE + PIN_INPUT_DDR
+                p_IO_STANDARD   = "SB_LVCMOS",
+                io_PACKAGE_PIN  = io[j],
+                i_CLOCK_ENABLE  = 1,
+                i_INPUT_CLK     = clk,
+                i_OUTPUT_CLK    = clk,
+                i_OUTPUT_ENABLE = oe1[j],
+                i_D_OUT_0       = o1[j],
+                i_D_OUT_1       = o2[j],
+            )
+
+            if i_async is not None:
+                # SB_IO cannot expose its registered posedge input and asynchronous input at the
+                # same time. Select the asynchronous input and recreate the posedge register in a
+                # fabric flip-flop; the negedge input remains in the I/O cell.
+                pin_i = Signal()
+                parameters.update(
+                    p_PIN_TYPE = C(0b110001, 6),
+                    o_D_IN_0   = pin_i,
+                )
+                self.comb += i_async[j].eq(pin_i)
+                if i1 is not None:
+                    parameters.update(o_D_IN_1=i2[j])
+                    self.specials += Instance("SB_DFF",
+                        i_C = clk,
+                        i_D = pin_i,
+                        o_Q = i1[j],
+                    )
+            elif i1 is not None:
+                parameters.update(
+                    o_D_IN_0 = i1[j],
+                    o_D_IN_1 = i2[j],
+                )
+
+            self.specials += Instance("SB_IO", **parameters)
+
+
+class LatticeiCE40DDRTristate:
+    @staticmethod
+    def lower(dr):
+        return LatticeiCE40DDRTristateImpl(
+            dr.io, dr.o1, dr.o2, dr.oe1, dr.oe2, dr.i1, dr.i2, dr.clk, dr.i_async)
+
 # iCE40 SDR Output ---------------------------------------------------------------------------------
 
 class LatticeiCE40SDROutputImpl(Module):
     def __init__(self, i, o, clk):
-        self.specials += Instance("SB_IO",
-            p_PIN_TYPE      = C(0b010100, 6), # PIN_OUTPUT_REGISTERED
-            p_IO_STANDARD   = "SB_LVCMOS",
-            io_PACKAGE_PIN  = o,
-            i_CLOCK_ENABLE  = 1,
-            i_OUTPUT_CLK    = clk,
-            i_OUTPUT_ENABLE = 1,
-            i_D_OUT_0       = i
-        )
+        for j in range(len(o)):
+            self.specials += Instance("SB_IO",
+                # i_INPUT_CLK must match between two SB_IOs in the same tile.
+                # In PIN_INPUT mode, this restriction is relaxed; an unconnected
+                # i_INPUT_CLK also works.
+                p_PIN_TYPE      = C(0b010101, 6), # PIN_OUTPUT_REGISTERED + PIN_INPUT
+                p_IO_STANDARD   = "SB_LVCMOS",
+                io_PACKAGE_PIN  = o[j],
+                i_CLOCK_ENABLE  = 1,
+                i_OUTPUT_CLK    = clk,
+                i_OUTPUT_ENABLE = 1,
+                i_D_OUT_0       = i[j]
+            )
 
 class LatticeiCE40SDROutput:
     @staticmethod
@@ -399,21 +617,25 @@ class LatticeiCE40SDROutput:
 class LatticeiCE40SDRInput:
     @staticmethod
     def lower(dr):
-        return LatticeiCE40DDRInputImpl(dr.i, dr.o, Signal(), dr.clk)
+        return LatticeiCE40DDRInputImpl(dr.i, dr.o, Signal(len(dr.o)), dr.clk)
 
 # iCE40 SDR Tristate -------------------------------------------------------------------------------
 
 class LatticeiCE40SDRTristateImpl(Module):
     def __init__(self, io, o, oe, i, clk):
-        self.specials += Instance("SB_IO",
-            p_PIN_TYPE      = C(0b110100, 6), # PIN_OUTPUT_REGISTERED_ENABLE_REGISTERED + PIN_INPUT_REGISTERED
-            io_PACKAGE_PIN  = io,
-            i_INPUT_CLK     = clk,
-            i_OUTPUT_CLK    = clk,
-            i_OUTPUT_ENABLE = oe,
-            i_D_OUT_0       = o,
-            o_D_IN_0        = i,
-        )
+        if i is None:
+            i = Signal().like(o)
+        for j in range(len(io)):
+            self.specials += Instance("SB_IO",
+                p_PIN_TYPE      = C(0b110100, 6), # PIN_OUTPUT_REGISTERED_ENABLE_REGISTERED + PIN_INPUT_REGISTERED
+                io_PACKAGE_PIN  = io[j],
+                i_CLOCK_ENABLE  = 1,
+                i_INPUT_CLK     = clk,
+                i_OUTPUT_CLK    = clk,
+                i_OUTPUT_ENABLE = oe[j],
+                i_D_OUT_0       = o[j] ,
+                o_D_IN_0        = i[j] ,
+            )
 
 class LatticeiCE40SDRTristate(Module):
     @staticmethod
@@ -426,8 +648,10 @@ lattice_ice40_special_overrides = {
     AsyncResetSynchronizer: LatticeiCE40AsyncResetSynchronizer,
     Tristate:               LatticeiCE40Tristate,
     DifferentialOutput:     LatticeiCE40DifferentialOutput,
+    DifferentialInput:      LatticeiCE40DifferentialInput,
     DDROutput:              LatticeiCE40DDROutput,
     DDRInput:               LatticeiCE40DDRInput,
+    DDRTristate:            LatticeiCE40DDRTristate,
     SDROutput:              LatticeiCE40SDROutput,
     SDRInput:               LatticeiCE40SDRInput,
     SDRTristate:            LatticeiCE40SDRTristate,

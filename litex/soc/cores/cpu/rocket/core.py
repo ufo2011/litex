@@ -30,119 +30,143 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import os
+import logging
 
 from migen import *
 
+from litex.gen import *
+
 from litex import get_data_mod
+
 from litex.soc.interconnect import axi
 from litex.soc.interconnect import wishbone
+
+from litex.soc.integration.soc import SoCRegion
+
 from litex.soc.cores.cpu import CPU, CPU_GCC_TRIPLE_RISCV64
 
+# Rocket  ------------------------------------------------------------------------------------------
 
-CPU_VARIANTS = {
-    "standard": "freechips.rocketchip.system.LitexConfig",
-    "linux":    "freechips.rocketchip.system.LitexLinuxConfig",
-    "linuxd":   "freechips.rocketchip.system.LitexLinuxDConfig",
-    "linuxq":   "freechips.rocketchip.system.LitexLinuxQConfig",
-    "full":     "freechips.rocketchip.system.LitexFullConfig",
-}
-
-GCC_FLAGS = {
-    "standard": "-march=rv64imac   -mabi=lp64 ",
-    "linux":    "-march=rv64imac   -mabi=lp64 ",
-    "linuxd":   "-march=rv64imac   -mabi=lp64 ",
-    "linuxq":   "-march=rv64imac   -mabi=lp64 ",
-    "full":     "-march=rv64imafdc -mabi=lp64 ",
-}
-
-AXI_DATA_WIDTHS = {
-    # variant : (mem, mmio)
-    "standard": ( 64,  64),
-    "linux":    ( 64,  64),
-    "linuxd":   (128,  64),
-    "linuxq":   (256,  64),
-    "full":     ( 64,  64),
-}
-
-class RocketRV64(CPU):
+class Rocket(CPU):
+    category             = "softcore"
+    family               = "riscv"
     name                 = "rocket"
     human_name           = "RocketRV64[imac]"
-    variants             = CPU_VARIANTS
+    variants             = ["small", "medium", "linux", "full"]
     data_width           = 64
     endianness           = "little"
     gcc_triple           = CPU_GCC_TRIPLE_RISCV64
     linker_output_format = "elf64-littleriscv"
     nop                  = "nop"
-    io_regions           = {0x10000000: 0x70000000} # origin, length
+    io_regions           = {0x1200_0000: 0x6e00_0000} # Origin, Length.
 
+    # Default parameters.
+    cpu_num_cores = 1
+    cpu_mem_width = 1
+
+    # Command line configuration arguments.
+    @staticmethod
+    def args_fill(parser):
+        cpu_group = parser.add_argument_group(title="CPU options")
+        cpu_group.add_argument("--cpu-num-cores", default=1, help="Number of cores (1, 2, 4, 8).", type=int)
+        cpu_group.add_argument("--cpu-mem-width", default=1, help="Width of memory port (1, 2, 4, 8).", type=int)
+
+    @staticmethod
+    def args_read(args):
+        logger = logging.getLogger("RocketArgs")
+        if int(args.cpu_num_cores) in [1, 2, 4, 8]:
+            Rocket.cpu_num_cores = int(args.cpu_num_cores)
+        else:
+            logger.error("Invalid '--cpu-num-cores {}' (should be 1, 2, 4, or 8)".format(args.cpu_num_cores))
+            quit()
+        if int(args.cpu_mem_width) in [1, 2, 4, 8]:
+            Rocket.cpu_mem_width = int(args.cpu_mem_width)
+        else:
+            logger.error("Invalid '--cpu-mem-width {}' (should be 1, 2, 4, or 8)".format(args.cpu_mem_width))
+            quit()
+
+    # Arch.
+    @staticmethod
+    def get_arch(variant):
+        if variant in ["linux", "full"]:
+            return "rv64i2p0_mafdc"
+        else:
+            return "rv64i2p0_mac"
+
+    # Memory Mapping.
     @property
     def mem_map(self):
         # Rocket reserves the first 256Mbytes for internal use, so we must change default mem_map.
         return {
-            "rom"      : 0x10000000,
-            "sram"     : 0x11000000,
-            "csr"      : 0x12000000,
-            "ethmac"   : 0x30000000,
-            "main_ram" : 0x80000000,
+            "clint"    : 0x0200_0000,
+            "plic"     : 0x0c00_0000,
+            "rom"      : 0x1000_0000,
+            "sram"     : 0x1100_0000,
+            "csr"      : 0x1200_0000,
+            "ethmac"   : 0x3000_0000,
+            "main_ram" : 0x8000_0000,
         }
 
+    # GCC Flags.
     @property
     def gcc_flags(self):
         flags =  "-mno-save-restore "
-        flags += GCC_FLAGS[self.variant]
+        flags += f"-march={self.get_arch(self.variant)} -mabi=lp64 "
         flags += "-D__rocket__ "
+        flags += "-D__riscv_plic__ "
+        flags += "-mcmodel=medany"
         return flags
 
-    def __init__(self, platform, variant="standard"):
+    def __init__(self, platform, variant="linux"):
         self.platform  = platform
         self.variant   = variant
 
         self.reset     = Signal()
-        self.interrupt = Signal(4)
+        self.interrupt = Signal(8)
 
-        mem_dw, mmio_dw = AXI_DATA_WIDTHS[self.variant]
+        mem_dw = 64 * Rocket.cpu_mem_width
+        mmio_dw = 64
 
         self.mem_axi   =  mem_axi = axi.AXIInterface(data_width=mem_dw,  address_width=32, id_width=4)
         self.mmio_axi  = mmio_axi = axi.AXIInterface(data_width=mmio_dw, address_width=32, id_width=4)
         self.l2fb_axi  = l2fb_axi = axi.AXIInterface(data_width=mmio_dw, address_width=32, id_width=4)
 
-        self.mmio_wb   = mmio_wb = wishbone.Interface(data_width=mmio_dw, adr_width=32-log2_int(mmio_dw//8))
-        self.l2fb_wb   = l2fb_wb = wishbone.Interface(data_width=mmio_dw, adr_width=32-log2_int(mmio_dw//8))
+        self.mmio_wb   = mmio_wb = wishbone.Interface(data_width=mmio_dw, adr_width=32-log2_int(mmio_dw//8), addressing="word")
+        self.l2fb_wb   = l2fb_wb = wishbone.Interface(data_width=mmio_dw, adr_width=32-log2_int(mmio_dw//8), addressing="word")
 
-        self.memory_buses = [mem_axi]
-        self.periph_buses = [mmio_wb]
-        self.dma_bus      =  l2fb_wb
+        self.memory_buses = [mem_axi] # Peripheral buses (Connected to main SoC's bus).
+        self.periph_buses = [mmio_wb] # Memory buses (Connected directly to LiteDRAM).
+        self.dma_bus      =  l2fb_wb  # DMA bus (Arbitrated and connected to SoC's bus).
 
         # # #
 
         self.cpu_params = dict(
-            # clock, reset
-            i_clock=ClockSignal(),
-            i_reset=ResetSignal() | self.reset,
+            # Clk / Rst.
+            i_clock = ClockSignal("sys"),
+            i_reset = ResetSignal("sys") | self.reset,
 
-            # debug (ignored)
-            #i_resetctrl_hartIsInReset_0           = 0,
-            i_debug_clock                          = 0,
-            i_debug_reset                          = ResetSignal() | self.reset,
-            #o_debug_clockeddmi_dmi_req_ready      = ,
-            i_debug_clockeddmi_dmi_req_valid       = 0,
-            i_debug_clockeddmi_dmi_req_bits_addr   = 0,
-            i_debug_clockeddmi_dmi_req_bits_data   = 0,
-            i_debug_clockeddmi_dmi_req_bits_op     = 0,
-            i_debug_clockeddmi_dmi_resp_ready      = 0,
-            #o_debug_clockeddmi_dmi_resp_valid     = ,
-            #o_debug_clockeddmi_dmi_resp_bits_data = ,
-            #o_debug_clockeddmi_dmi_resp_bits_resp = ,
-            i_debug_clockeddmi_dmiClock            = 0,
-            i_debug_clockeddmi_dmiReset            = ResetSignal() | self.reset,
-            #o_debug_ndreset                       = ,
-            #o_debug_dmactive                      = ,
-            i_debug_dmactiveAck                    = 0,
+            # Debug (ignored).
+            i_debug_clock                         = 0,
+            i_debug_reset                         = ResetSignal() | self.reset,
+            o_debug_clockeddmi_dmi_req_ready      = Open(),
+            i_debug_clockeddmi_dmi_req_valid      = 0,
+            i_debug_clockeddmi_dmi_req_bits_addr  = 0,
+            i_debug_clockeddmi_dmi_req_bits_data  = 0,
+            i_debug_clockeddmi_dmi_req_bits_op    = 0,
+            i_debug_clockeddmi_dmi_resp_ready     = 0,
+            o_debug_clockeddmi_dmi_resp_valid     = Open(),
+            o_debug_clockeddmi_dmi_resp_bits_data = Open(),
+            o_debug_clockeddmi_dmi_resp_bits_resp = Open(),
+            i_debug_clockeddmi_dmiClock           = 0,
+            i_debug_clockeddmi_dmiReset           = ResetSignal() | self.reset,
+            o_debug_ndreset                       = Open(),
+            o_debug_dmactive                      = Open(),
+            i_debug_dmactiveAck                   = 0,
 
-            # irq
-            i_interrupts=self.interrupt,
+            # IRQ.
+            i_interrupts = self.interrupt,
 
-            # axi memory (L1-cached)
+            # AXI Memory (L1-cached).
             i_mem_axi4_0_aw_ready      = mem_axi.aw.ready,
             o_mem_axi4_0_aw_valid      = mem_axi.aw.valid,
             o_mem_axi4_0_aw_bits_id    = mem_axi.aw.id,
@@ -185,7 +209,7 @@ class RocketRV64(CPU):
             i_mem_axi4_0_r_bits_resp   = mem_axi.r.resp,
             i_mem_axi4_0_r_bits_last   = mem_axi.r.last,
 
-            # axi mmio (not cached)
+            # AXI MMIO (not cached).
             i_mmio_axi4_0_aw_ready      = mmio_axi.aw.ready,
             o_mmio_axi4_0_aw_valid      = mmio_axi.aw.valid,
             o_mmio_axi4_0_aw_bits_id    = mmio_axi.aw.id,
@@ -228,7 +252,7 @@ class RocketRV64(CPU):
             i_mmio_axi4_0_r_bits_resp   = mmio_axi.r.resp,
             i_mmio_axi4_0_r_bits_last   = mmio_axi.r.last,
 
-            # axi l2fb (slave, for e.g., DMA)
+            # AXI L2FB (Slave, for e.g., DMA).
             o_l2_frontend_bus_axi4_0_aw_ready      = l2fb_axi.aw.ready,
             i_l2_frontend_bus_axi4_0_aw_valid      = l2fb_axi.aw.valid,
             i_l2_frontend_bus_axi4_0_aw_bits_id    = l2fb_axi.aw.id,
@@ -271,32 +295,32 @@ class RocketRV64(CPU):
             o_l2_frontend_bus_axi4_0_r_bits_resp   = l2fb_axi.r.resp,
             o_l2_frontend_bus_axi4_0_r_bits_last   = l2fb_axi.r.last,
         )
+        # additional per-core debug signals:
+        self.cpu_params.update({'i_resetctrl_hartIsInReset_%s'%i : Open() for i in range(Rocket.cpu_num_cores)})
 
-        # adapt axi interfaces to wishbone
-        # NOTE: AXI2Wishbone FSMs must be reset with the CPU!
-        mmio_a2w = ResetInserter()(axi.AXI2Wishbone(mmio_axi, mmio_wb, base_address=0))
-        self.comb += mmio_a2w.reset.eq(ResetSignal() | self.reset)
+        # Adapt AXI interfaces to Wishbone.
+        mmio_a2w = axi.AXI2Wishbone(mmio_axi, mmio_wb, base_address=0)
         self.submodules += mmio_a2w
 
-        l2fb_a2w = ResetInserter()(axi.Wishbone2AXI(l2fb_wb, l2fb_axi, base_address=0))
-        self.comb += l2fb_a2w.reset.eq(ResetSignal() | self.reset)
+        l2fb_a2w = axi.Wishbone2AXI(l2fb_wb, l2fb_axi, base_address=0)
         self.submodules += l2fb_a2w
 
-        # add verilog sources
+        # Add Verilog sources.
         self.add_sources(platform, variant)
 
     def set_reset_address(self, reset_address):
-        assert not hasattr(self, "reset_address")
         self.reset_address = reset_address
-        assert reset_address == 0x10000000, "cpu_reset_addr hardcoded in during elaboration!"
+        assert reset_address == 0x1000_0000, "cpu_reset_addr hardcoded in during elaboration!"
 
     @staticmethod
-    def add_sources(platform, variant="standard"):
+    def add_sources(platform, variant):
+        pfx = "freechips.rocketchip.system.LitexConfig"
+        fname = f"{pfx}_{variant}_{Rocket.cpu_num_cores}_{Rocket.cpu_mem_width}"
         vdir = get_data_mod("cpu", "rocket").data_location
         platform.add_sources(
             os.path.join(vdir, "generated-src"),
-            CPU_VARIANTS[variant] + ".v",
-            CPU_VARIANTS[variant] + ".behav_srams.v",
+            f"{fname}.v",
+            f"{fname}.behav_srams.v",
         )
         platform.add_sources(
             os.path.join(vdir, "vsrc"),
@@ -304,6 +328,33 @@ class RocketRV64(CPU):
             "AsyncResetReg.v",
             "EICG_wrapper.v",
         )
+
+    def add_soc_components(self, soc):
+        # Add OpenSBI/PLIC/CLINT regions.
+        soc.bus.add_region("opensbi", SoCRegion(origin=self.mem_map["main_ram"] + 0x0000_0000, size=0x20_0000, cached=True,  linker=True))
+        soc.bus.add_region("plic",    SoCRegion(origin=soc.mem_map.get("plic"),                size=0x40_0000, cached=True,  linker=True))
+        soc.bus.add_region("clint",   SoCRegion(origin=soc.mem_map.get("clint"),               size= 0x1_0000, cached=True,  linker=True))
+
+        # Define number of CPUs
+        soc.add_config("CPU_COUNT", Rocket.cpu_num_cores)
+        soc.add_config("CPU_ISA",   self.get_arch(self.variant))
+        soc.add_config("CPU_MMU",   "sv39")
+
+        # Constants for Cache so we can add them in the DTS.
+        soc.add_config("CPU_DCACHE_SIZE",      16384) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_DCACHE_WAYS",         64) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_DCACHE_BLOCK_SIZE",   64) # CHECKME: correct/hardwired?
+
+        soc.add_config("CPU_ICACHE_SIZE",      16384) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_ICACHE_WAYS",         64) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_ICACHE_BLOCK_SIZE",   64) # CHECKME: correct/hardwired?
+
+        # Constants for TLB so we can add them in the DTS.
+        soc.add_config("CPU_DTLB_SIZE", 32) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_DTLB_WAYS",  1) # CHECKME: correct/hardwired?
+
+        soc.add_config("CPU_ITLB_SIZE", 32) # CHECKME: correct/hardwired?
+        soc.add_config("CPU_ITLB_WAYS",  1) # CHECKME: correct/hardwired?
 
     def do_finalize(self):
         assert hasattr(self, "reset_address")

@@ -6,8 +6,7 @@ ifdef TFTP_SERVER_PORT
 CFLAGS += -DTFTP_SERVER_PORT=$(TFTP_SERVER_PORT)
 endif
 
-OBJECTS = isr.o			\
-	  boot-helper.o		\
+OBJECTS = boot-helper.o	\
 	  boot.o			\
 	  helpers.o			\
 	  cmd_bios.o		\
@@ -19,27 +18,64 @@ OBJECTS = isr.o			\
 	  cmd_liteeth.o		\
 	  cmd_litesdcard.o  \
 	  cmd_litesata.o    \
-	  main.o
+	  sim_debug.o		\
+	  main.o            \
+	  crt0.o
 
-ifneq "$(or $(TERM_NO_COMPLETE),$(TERM_MINI))" ""
-CFLAGS += -DTERM_NO_COMPLETE
+ifneq "$(or $(BIOS_CONSOLE_NO_AUTOCOMPLETE),$(BIOS_CONSOLE_LITE))" ""
+CFLAGS += -DBIOS_CONSOLE_NO_AUTOCOMPLETE
 else
 OBJECTS += complete.o
 endif
 
-ifdef TERM_NO_HIST
-CFLAGS += -DTERM_NO_HIST
+ifdef BIOS_CONSOLE_NO_HISTORY
+CFLAGS += -DBIOS_CONSOLE_NO_HISTORY
 endif
 
-ifdef TERM_MINI
-CFLAGS += -DTERM_MINI
+ifdef BIOS_CONSOLE_DISABLE
+CFLAGS += -DBIOS_CONSOLE_DISABLE
+endif
+
+ifdef BIOS_CONSOLE_NO_ANSI
+CFLAGS += -DBIOS_CONSOLE_NO_ANSI
+endif
+
+ifdef BIOS_CONSOLE_LITE
+CFLAGS += -DBIOS_CONSOLE_LITE
 OBJECTS += readline_simple.o
 else
 OBJECTS += readline.o
 endif
 
+ifeq ($(CPU), zynq7000)
+LSCRIPT = linker-zynq.ld
+else ifeq ($(CPU), zynqmp)
+LSCRIPT = linker-zynqmp.ld
+else
+LSCRIPT = linker.ld
+endif
+
+COMMA = ,
+REGULAR_LIBS = $(filter-out $(ALWAYS_LINK_LIBS),$(LIBS))
+ALWAYS_LINK_LIBFLAGS = $(if $(ALWAYS_LINK_LIBS),-Wl$(COMMA)--whole-archive $(ALWAYS_LINK_LIBS:lib%=-l%) -Wl$(COMMA)--no-whole-archive)
+
+ifneq ($(BIOS_STACK_MARGIN),)
+MEMUSAGE_ARGS += --fail-stack-margin $(BIOS_STACK_MARGIN)
+endif
+
+ifneq ($(BIOS_ROM_BUDGET),)
+MEMUSAGE_ARGS += --max-rom $(BIOS_ROM_BUDGET)
+endif
+ifneq ($(BIOS_SRAM_BUDGET),)
+MEMUSAGE_ARGS += --max-sram $(BIOS_SRAM_BUDGET)
+endif
+
+ifneq ($(BIOS_BOOT_SRAM_SIZE),)
+LDFLAGS += -Wl,--defsym=__bios_boot_sram_size=$(BIOS_BOOT_SRAM_SIZE)
+endif
+
 all: bios.bin
-	$(PYTHON) -m litex.soc.software.memusage bios.elf $(CURDIR)/../include/generated/regions.ld $(TRIPLE)
+	$(PYTHON) -m litex.soc.software.memusage $(MEMUSAGE_ARGS) bios.elf $(CURDIR)/../include/generated/regions.ld $(TRIPLE)
 
 %.bin: %.elf
 	$(OBJCOPY) -O binary $< $@
@@ -47,35 +83,30 @@ ifneq ($(OS),Windows_NT)
 	chmod -x $@
 endif
 ifeq ($(CPUENDIANNESS),little)
-	$(PYTHON) -m litex.soc.software.mkmscimg $@ --little
+	$(PYTHON) -m litex.soc.software.crcfbigen $@ --little
 else
-	$(PYTHON) -m litex.soc.software.mkmscimg $@
+	$(PYTHON) -m litex.soc.software.crcfbigen $@
 endif
 
-bios.elf: $(BIOS_DIRECTORY)/linker.ld $(OBJECTS)
+%.dis: %.elf
+	$(OBJDUMP) -D $< > $@
 
+dis: bios.dis
 
-%.elf: ../libbase/crt0.o \
-	../libcompiler_rt/libcompiler_rt.a \
-	../libbase/libbase-nofloat.a \
-	../liblitedram/liblitedram.a \
-	../libliteeth/libliteeth.a \
-	../liblitespi/liblitespi.a \
-	../libfatfs/libfatfs.a \
-	../liblitesdcard/liblitesdcard.a \
-	../liblitesata/liblitesata.a
-	$(LD) $(LDFLAGS) -T $(BIOS_DIRECTORY)/linker.ld -N -o $@ \
-		../libbase/crt0.o \
+bios.elf: $(BIOS_DIRECTORY)/$(LSCRIPT) $(OBJECTS)
+
+vpath %.a $(PACKAGES:%=../%)
+
+%.elf: crt0.o $(LIBS:%=%.a)
+	$(CC) $(LDFLAGS) -T $(BIOS_DIRECTORY)/$(LSCRIPT) -N -o $@ \
 		$(OBJECTS) \
-		-L../libcompiler_rt \
-		-L../libbase \
-		-L../liblitedram \
-		-L../libliteeth \
-		-L../liblitespi \
-		-L../libfatfs \
-		-L../liblitesdcard \
-		-L../liblitesata \
-		-llitedram -lliteeth -llitespi -lfatfs -llitesdcard -llitesata -lbase-nofloat -lcompiler_rt
+		$(PACKAGES:%=-L../%) \
+		-Wl,--start-group \
+		$(REGULAR_LIBS:lib%=-l%) \
+		$(ALWAYS_LINK_LIBFLAGS) \
+		-Wl,--end-group \
+		-Wl,--gc-sections \
+		-Wl,-Map,$@.map
 
 ifneq ($(OS),Windows_NT)
 	chmod -x $@
@@ -84,19 +115,15 @@ endif
 # pull in dependency info for *existing* .o files
 -include $(OBJECTS:.o=.d)
 
-%.o: $(BIOS_DIRECTORY)/%.c
+VPATH = $(BIOS_DIRECTORY):$(BIOS_DIRECTORY)/cmds:$(CPU_DIRECTORY)
+
+%.o: %.c
 	$(compile)
 
-%.o: $(BIOS_DIRECTORY)/cmds/%.c
-	$(compile)
-
-%.o: $(BIOS_DIRECTORY)/%.S
-	$(assemble)
-
-boot-helper.o: $(CPU_DIRECTORY)/boot-helper.S
+%.o: %.S
 	$(assemble)
 
 clean:
-	$(RM) $(OBJECTS) bios.elf bios.bin .*~ *~
+	$(RM) $(OBJECTS) bios.elf bios.dis bios.bin .*~ *~
 
-.PHONY: all clean
+.PHONY: all clean dis

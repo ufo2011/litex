@@ -1,0 +1,180 @@
+# LiteX BIOS Configuration
+
+LiteX exposes SoC configuration values to the BIOS through generated C
+headers. These values are usually created from Python with:
+
+```python
+soc.add_config("FOO", value)
+```
+
+This generates `CONFIG_FOO` in `generated/soc.h`. If `value` is omitted, the
+symbol is generated without a value and can be used with `#ifdef`.
+
+Use `soc.add_config()` for configuration values that are part of the SoC
+description and are needed by the BIOS or other LiteX software. Use
+`soc.add_constant()` for non-`CONFIG_` constants such as peripheral parameters,
+addresses exported to external tools, or feature-specific data.
+
+## Manual BIOS Options
+
+These options can be added by a target or SoC to reduce BIOS output, simulation
+time, or boot behavior:
+
+| Config | Effect |
+| --- | --- |
+| `CONFIG_BIOS_NO_PROMPT` | Do not show the LiteX banner/prompt at boot. |
+| `CONFIG_BIOS_NO_DELAYS` | Disable BIOS delay loops. Useful for simulation. |
+| `CONFIG_BIOS_NO_BUILD_TIME` | Do not print the C build date/time. Enabled automatically when `compile_software=False`. |
+| `CONFIG_BIOS_NO_CRC` | Skip BIOS CRC display/check. Useful on slow simulations. |
+| `CONFIG_BIOS_NO_BOOT` | Disable the BIOS boot sequence. |
+
+Example:
+
+```python
+self.add_config("BIOS_NO_PROMPT")
+self.add_config("BIOS_NO_DELAYS")
+```
+
+## BIOS Build Options
+
+Some BIOS options are build flags rather than generated SoC constants:
+
+| Build flag | Effect |
+| --- | --- |
+| `BIOS_CONSOLE_NO_ANSI` | Build the BIOS console without ANSI escape sequences. |
+
+When using `Builder`, this can be selected with `bios_console_no_ansi=True`.
+
+The make/environment variables `BIOS_ROM_BUDGET` and `BIOS_SRAM_BUDGET` set
+optional byte limits checked after linking. For example,
+`BIOS_ROM_BUDGET=0x10000 BIOS_SRAM_BUDGET=0x1800 litex_sim ...` fails if
+the selected configuration exceeds 64 KiB of ROM or 6 KiB of allocated SRAM.
+SRAM usage includes an explicit boot buffer or stack section, but not an
+implicit stack. Use `--bios-stack-margin` as well to protect stack headroom.
+Choose limits per CPU/feature configuration; no budgets are enabled by default.
+
+## Command Usage
+
+`help <command>` shows a command's description and registered usage.
+Core memory, flash and boot commands reject missing or excess arguments
+before invoking a handler. Lines exceeding `MAX_PARAM` are rejected entirely.
+
+Target commands can opt into the same checks with:
+
+```c
+define_command_args(example, example_handler, "Example command",
+    "example <value> [count]", 1, 2, SYSTEM_CMDS);
+```
+
+Existing `define_command()` registrations remain supported. Checked unsigned
+parsers in `<libbase/parse.h>` accept decimal, `0`-prefixed octal and
+`0x`-prefixed hexadecimal numbers, rejecting signs, whitespace and overflow.
+
+## Transfer Timeouts
+
+TFTP uses a five-second request/inactivity deadline by default, configurable
+with `TFTP_TIMEOUT_US`. SPI SD byte transfers use `SPISDCARD_XFER_TIMEOUT_US`
+(10 ms by default). These are system-clock deadlines rather than polling
+iteration counts.
+
+The shared timeout helper uses uptime when available. Otherwise, it puts
+timer0 in free-running mode; callers must not reprogram timer0 (including via
+`busy_wait`) while a deadline is active. Nested deadlines are supported.
+
+## SRAM Boot Images
+
+The BIOS reserves its SRAM for runtime data and stack. Serial and manifest
+loads into that region are rejected by default, including through aliases.
+With the standard BIOS linker script, a fresh build with the make/environment
+variable `BIOS_BOOT_SRAM_SIZE` reserves an image buffer at the beginning of
+SRAM and moves BIOS data after it. For example, `BIOS_BOOT_SRAM_SIZE=0x1000`
+reserves 4 KiB. Leave enough SRAM for BIOS data and stack, and use
+`--bios-stack-margin` to enforce the required remaining stack space.
+
+Custom linker scripts can reserve a buffer and export
+`__bios_boot_sram_start` / `__bios_boot_sram_end` (exclusive end). The buffer
+must not overlap BIOS code, data or stack. Zynq linker scripts do not currently
+provide this optional buffer.
+
+## Boot Manifests
+
+Network, SD and SATA boot share the same manifest validation. Image entries
+map filenames to load addresses; optional `bootargs` metadata sets the entry
+point and registers:
+
+```json
+{
+    "image.bin": "0x40000000",
+    "bootargs": {
+        "addr": "0x40000000",
+        "r1": "0x12345678"
+    }
+}
+```
+
+Without `addr`, the BIOS jumps to the last image's load address. Registers
+default to zero. Top-level `addr`, `r1`, `r2` and `r3` remain supported.
+Duplicate keys, invalid addresses and unsupported nesting are rejected
+before loading. Each image is bounded by available RAM and the next image's
+destination, including aliases of the same physical memory.
+
+## Flash Boot Bounds
+
+`FLASH_BOOT_MAX_SIZE` limits the accepted image payload length (by default,
+`MAIN_RAM_SIZE`, or 16 MiB without main RAM). When `SPIFLASH_BASE` and
+`SPIFLASH_SIZE` are present, the BIOS also checks that the eight-byte header
+and payload fit in that flash mapping before reading the payload for CRC.
+Targets using a different mapping can set `FLASH_BOOT_REGION_BASE` and
+`FLASH_BOOT_REGION_SIZE` to describe it. Both values must be supplied together.
+
+## Generated SoC Metadata
+
+LiteX generates several `CONFIG_` values from the SoC, CPU, bus and CSR
+configuration. These are not normally set manually by targets.
+
+| Config | Meaning |
+| --- | --- |
+| `CONFIG_PLATFORM_NAME` | Platform name. |
+| `CONFIG_CLOCK_FREQUENCY` | SoC system clock frequency in Hz. |
+| `CONFIG_CPU_TYPE_<name>` | Selected CPU type. |
+| `CONFIG_CPU_VARIANT_<variant>` | Selected CPU variant. |
+| `CONFIG_CPU_FAMILY` | CPU family string. |
+| `CONFIG_CPU_NAME` | CPU name string. |
+| `CONFIG_CPU_HUMAN_NAME` | CPU display name used by the BIOS banner. |
+| `CONFIG_CPU_NOP` | CPU no-op instruction used by delay helpers. |
+| `CONFIG_CPU_HAS_INTERRUPT` | CPU interrupt support is present. |
+| `CONFIG_CPU_INTERRUPTS` | Number of CPU interrupt lines exposed to LiteX software. |
+| `CONFIG_CPU_HAS_DMA_BUS` | CPU has a DMA-capable bus. |
+| `CONFIG_BUS_STANDARD` | Main SoC bus standard. |
+| `CONFIG_BUS_DATA_WIDTH` | Main SoC bus data width. |
+| `CONFIG_BUS_ADDRESS_WIDTH` | Main SoC bus address width. |
+| `CONFIG_BUS_BURSTING` | Main SoC bus supports bursting. |
+| `CONFIG_CSR_DATA_WIDTH` | CSR bus data width. |
+| `CONFIG_CSR_ALIGNMENT` | CSR register alignment in bits. |
+| `CONFIG_CSR_ORDERING_BIG` | CSR subregister ordering is big-endian style. |
+| `CONFIG_CSR_ORDERING_LITTLE` | CSR subregister ordering is little-endian style. |
+| `CONFIG_MAIN_RAM_INIT` | Main RAM has an initialization image. |
+| `CONFIG_L2_SIZE` | L2 cache size when an L2 cache is present. |
+| `CONFIG_HAS_I2C` | At least one LiteX I2C controller is present. |
+
+Some CPU integrations also provide Linux/device-tree metadata, such as
+`CONFIG_CPU_COUNT`, `CONFIG_CPU_ISA`, `CONFIG_CPU_MMU`, cache sizes and TLB
+sizes. These values are CPU-specific and should be generated by the CPU
+integration rather than set manually by targets.
+
+## Peripheral Constants
+
+Peripheral helpers often export additional constants, for example interrupt
+numbers, FIFO properties, flash geometry, video framebuffer geometry, Ethernet
+slot sizes or local/remote IP address octets. These are part of the relevant
+peripheral/software interface and are intentionally not all listed here.
+
+When adding new constants:
+
+- use `CONFIG_` only for SoC-wide build configuration consumed by LiteX
+  software;
+- keep peripheral-specific constants named after the peripheral or feature;
+- prefer explicit names over reusing an existing config symbol with a different
+  meaning;
+- document software-visible behavior near the core or in the relevant user
+  documentation.

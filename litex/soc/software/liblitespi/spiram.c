@@ -1,0 +1,169 @@
+// Copyright (c) 2020 Antmicro <www.antmicro.com>
+// Copyright (c) 2024 Fin Maaß <f.maass@vogl-electronic.com>
+// License: BSD
+
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <libbase/memtest.h>
+
+#include <generated/csr.h>
+#include <generated/mem.h>
+#include <generated/soc.h>
+#include <system.h>
+
+#include "spiram.h"
+
+//#define SPIRAM_DEBUG
+
+#if defined(CSR_SPIRAM_BASE)
+
+/* Range tested by spiram_freq_init (and invalidated in the CPU data cache before each test). */
+#define SPIRAM_FREQ_TEST_SIZE min(SPIRAM_SIZE, MEMTEST_DATA_SIZE)
+
+static void spiram_clk_print(unsigned long freq)
+{
+	if (freq >= 1000000)
+		printf("%lu MHz", freq/1000000);
+	else
+		printf("%lu kHz", freq/1000);
+}
+
+int spiram_freq_init(void)
+{
+
+#ifdef CSR_SPIRAM_PHY_CLK_DIVISOR_ADDR
+
+	int data_errors = 0;
+	unsigned int lowest_div;
+
+	lowest_div = spiram_phy_clk_divisor_read();
+
+	invd_cpu_dcache_range((void *)SPIRAM_BASE, SPIRAM_FREQ_TEST_SIZE);
+	flush_l2_cache();
+
+	while((data_errors == 0) && (lowest_div-- > 0)) {
+		spiram_phy_clk_divisor_write((uint32_t)lowest_div);
+		invd_cpu_dcache_range((void *)SPIRAM_BASE, SPIRAM_FREQ_TEST_SIZE);
+		flush_l2_cache();
+		data_errors = memtest_data((unsigned int *) SPIRAM_BASE, SPIRAM_FREQ_TEST_SIZE, 1, NULL);
+#ifdef SPIRAM_DEBUG
+		printf("[DIV: %d]\n\r", lowest_div);
+#endif
+	}
+	lowest_div++;
+	/* LiteSPI clock generator: SCK = sys/div, div rounded up to an even value (2 minimum). */
+	printf("SPI RAM clk configured to ");
+	spiram_clk_print(CONFIG_CLOCK_FREQUENCY/(2*max(1, (lowest_div + 1)/2)));
+	printf(" (div: %d)\n", lowest_div);
+
+	spiram_phy_clk_divisor_write(lowest_div);
+
+#else
+
+	printf("SPI RAM clk configured to ");
+	spiram_clk_print(SPIRAM_PHY_FREQUENCY);
+	printf("\n");
+
+#endif
+
+	return 0;
+}
+
+void spiram_dummy_bits_setup(unsigned int dummy_bits)
+{
+	spiram_mmap_dummy_bits_write((uint32_t)dummy_bits);
+#ifdef SPIRAM_DEBUG
+	printf("Dummy bits set to: %" PRIx32 "\n\r", spiram_mmap_dummy_bits_read());
+#endif
+}
+
+#ifdef CSR_SPIRAM_MASTER_CS_ADDR
+
+static void spiram_len_mask_width_write(uint32_t len, uint32_t width, uint32_t mask)
+{
+	uint32_t tmp = len & ((1 <<  CSR_SPIRAM_MASTER_PHYCONFIG_LEN_SIZE) - 1);
+	uint32_t word = tmp << CSR_SPIRAM_MASTER_PHYCONFIG_LEN_OFFSET;
+	tmp = width & ((1 << CSR_SPIRAM_MASTER_PHYCONFIG_WIDTH_SIZE) - 1);
+	word |= tmp << CSR_SPIRAM_MASTER_PHYCONFIG_WIDTH_OFFSET;
+	tmp = mask & ((1 <<  CSR_SPIRAM_MASTER_PHYCONFIG_MASK_SIZE) - 1);
+	word |= tmp << CSR_SPIRAM_MASTER_PHYCONFIG_MASK_OFFSET;
+	spiram_master_phyconfig_write(word);
+}
+
+static bool spiram_rx_ready(void)
+{
+	return (spiram_master_status_read() >> CSR_SPIRAM_MASTER_STATUS_RX_READY_OFFSET) & 1;
+}
+
+static void spiram_master_write(uint32_t val, size_t len, size_t width, uint32_t mask)
+{
+	/* Be sure to empty RX queue before doing Xfer. */
+	while (spiram_rx_ready())
+		spiram_master_rxtx_read();
+
+	/* Configure Master */
+	spiram_len_mask_width_write(8*len, width, mask);
+
+	/* Set CS. */
+	spiram_master_cs_write(1);
+
+	/* Do Xfer. */
+	spiram_master_rxtx_write(val);
+	while (!spiram_rx_ready());
+
+	/* Clear RX queue. */
+	spiram_master_rxtx_read();
+
+	/* Clear CS. */
+	spiram_master_cs_write(0);
+}
+
+#endif
+
+void spiram_memspeed(void) {
+	/* Test Sequential Read accesses */
+	memspeed((unsigned int *) SPIRAM_BASE, 4096, 1, 0);
+
+	/* Test Random Read accesses */
+	memspeed((unsigned int *) SPIRAM_BASE, 4096, 1, 1);
+}
+
+void spiram_init(void)
+{
+	printf("\nInitializing %s SPI RAM @0x%08lx...\n", SPIRAM_MODULE_NAME, SPIRAM_BASE);
+
+/* Optional MMAP dummy bits override: add_spi_ram does not export SPIRAM_MODULE_DUMMY_BITS
+   (the MMAP already uses the dummy cycles of its read opcode), a target with a configurable
+   MMAP dummy_bits CSR can define it (soc.add_constant) to force another value at boot. */
+#ifdef SPIRAM_MODULE_DUMMY_BITS
+	spiram_dummy_bits_setup(SPIRAM_MODULE_DUMMY_BITS);
+#endif
+
+#ifdef CSR_SPIRAM_MASTER_CS_ADDR
+
+	/* Quad / QPI Configuration. */
+#ifdef SPIRAM_MODULE_QUAD_CAPABLE
+	printf("Enabling Quad mode...\n");
+	spiram_master_write(0x00000006, 1, 1, 0x1);
+	spiram_master_write(0x00014307, 3, 1, 0x1);
+#endif
+
+#ifdef SPIRAM_MODULE_QPI_CAPABLE
+	printf("Switching to QPI mode...\n");
+	spiram_master_write(0x00000035, 1, 1, 0x1);
+#endif
+
+#endif
+
+#ifndef SPIRAM_SKIP_FREQ_INIT
+	/* Clk frequency auto-calibration. */
+	spiram_freq_init();
+#endif
+
+	/* Test SPI RAM speed */
+	spiram_memspeed();
+}
+
+#endif

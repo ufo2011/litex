@@ -6,16 +6,101 @@
 # SPDX-License-Identifier: BSD-2-Clause
 
 import os
+import re
+import sys
+import math
 import subprocess
-from shutil import which
+import platform
+from shutil import which, copyfile
 
 from migen.fhdl.structure import _Fragment
 
-from litex.build.generic_platform import Pins, IOStandard, Misc
+from litex.build.generic_toolchain import GenericToolchain
+from litex.build.generic_platform import *
 from litex.build import tools
 
-def _build_cst(named_sc, named_pc):
-    lines = []
+# WSL Helpers --------------------------------------------------------------------------------------
+
+def _is_wsl():
+    if sys.platform != "linux":
+        return False
+    release = platform.release().lower()
+    return "microsoft" in release or "wsl" in release
+
+def _find_gowin_shell():
+    gw_sh      = "gw_sh"
+    gw_sh_path = which(gw_sh)
+
+    # On WSL, prefer native Linux Gowin when available but allow falling back to
+    # the Windows Gowin executable exposed through PATH.
+    if gw_sh_path is None and _is_wsl():
+        gw_sh      = "gw_sh.exe"
+        gw_sh_path = which(gw_sh)
+
+    return gw_sh, gw_sh_path
+
+def _gowin_uses_windows_paths():
+    if not _is_wsl():
+        return False
+
+    _, gw_sh_path = _find_gowin_shell()
+    if gw_sh_path is None:
+        return False
+
+    return os.path.basename(os.path.realpath(gw_sh_path)).lower().endswith(".exe")
+
+def _gowin_ide_path():
+    _, gw_sh_path = _find_gowin_shell()
+    if gw_sh_path is None:
+        return None
+    gw_bin_path   = os.path.split(gw_sh_path)[0]
+    gw_ide_path   = os.sep.join(gw_bin_path.split(os.sep)[:-1])
+    return gw_ide_path
+
+def _gowin_tcl_path(path, use_windows_paths=False):
+    if use_windows_paths and os.path.isabs(path):
+        path = subprocess.check_output(
+            ["wslpath", "-w", path],
+            universal_newlines=True
+        ).strip()
+
+    if sys.platform == "win32" or use_windows_paths:
+        path = path.replace("\\", "\\\\")
+
+    return path
+
+# Memories ------------------------------------------------------------------------------------------
+
+def _gowin_async_read_memories(verilog, ram_style="distributed_ram"):
+    """Memories with an asynchronous read port (LiteX memory header: "Read: Async") get a syn_ramstyle
+    attribute: Gowin maps them to Block RAMs (synchronous read) without error or warning, but they then
+    behave differently on hardware (read data lagging/wrong, ex: a FIFO returning zeros). Returns the
+    Verilog and the names of the memories modified (memories with a syn_ramstyle already are kept)."""
+    names = []
+    def add_ram_style(m):
+        header, decl, name, attrs = m.group(1), m.group(3), m.group(2), m.group(4)
+        if "Read: Async" not in header or "syn_ramstyle" in attrs:
+            return m.group(0)
+        names.append(name)
+        return f"{header}{decl}{attrs} /* synthesis syn_ramstyle = \"{ram_style}\" */;"
+    verilog = re.sub(r"(// Memory (\w+): [^\n]*\n//-+\n(?:// Port [^\n]*\n)+)(reg \[\d+:0\] \2\[0:\d+\])([^;\n]*);",
+        add_ram_style, verilog)
+    return verilog, names
+
+# Constraints (.cst) -------------------------------------------------------------------------------
+
+def _is_differential_iostandard(iostandard):
+    name = iostandard.name.upper()
+    return name.endswith(("D", "D_I", "D_II")) or "LVDS" in name
+
+def _use_differential_constraint(other):
+    iostandards = [c for c in other if isinstance(c, IOStandard)]
+    if not iostandards:
+        return True
+    return any(_is_differential_iostandard(iostandard) for iostandard in iostandards)
+
+def _build_cst(named_sc, named_pc, additional_cst_commands, build_name):
+    cst = []
 
     flat_sc = []
     for name, pins, other, resource in named_sc:
@@ -25,106 +110,243 @@ def _build_cst(named_sc, named_pc):
         else:
             flat_sc.append((name, pins[0], other))
 
+    def _search_pin_entry(pin_lst, pin_name):
+        for name, pin, other in pin_lst:
+            if pin_name == name:
+                return (name, pin, other)
+        return (None, None, None)
+
     for name, pin, other in flat_sc:
         if pin != "X":
-            lines.append(f"IO_LOC \"{name}\" {pin};")
+            t_name = name.split('[') # avoid index pins
+            tmp_name = t_name[0]
+            if tmp_name[-2:] == "_p" and _use_differential_constraint(other):
+                pn = tmp_name[:-2] + "_n"
+                if len(t_name) > 1:
+                    pn += '[' + t_name[1]
+                (_, n_pin, _) = _search_pin_entry(flat_sc, pn)
+                if n_pin is not None:
+                    pin = f"{pin},{n_pin}"
+            elif tmp_name[-2:] == "_n":
+                pp = tmp_name[:-2] + "_p"
+                if len(t_name) > 1:
+                    pp += '[' + t_name[1]
+                (p_name, _, p_other) = _search_pin_entry(flat_sc, pp)
+                if p_name is not None and _use_differential_constraint(p_other):
+                    continue
+            cst.append(f"IO_LOC \"{name}\" {pin};")
 
+        other_cst = []
         for c in other:
             if isinstance(c, IOStandard):
-                lines.append(f"IO_PORT \"{name}\" IO_TYPE={c.name};")
+                other_cst.append(f"IO_TYPE={c.name}")
             elif isinstance(c, Misc):
-                lines.append(f"IO_PORT \"{name}\" {c.misc};")
+                other_cst.append(f"{c.misc}")
+        if len(other_cst):
+            t = " ".join(other_cst)
+            cst.append(f"IO_PORT \"{name}\" {t};")
 
     if named_pc:
-        lines.extend(named_pc)
+        cst.extend(named_pc)
 
-    cst = "\n".join(lines)
-    with open("top.cst", "w") as f:
-        f.write(cst)
+    cst.extend(additional_cst_commands)
 
-def _build_script(name, partnumber, files, options):
-    lines = [
-        f"set_device -name {name} {partnumber}",
-        "add_file top.cst",
-    ]
+    tools.write_to_file(build_name + ".cst", "\n".join(cst))
 
-    for f, typ, lib in files:
-        lines.append(f"add_file {f}")
+# GowinToolchain -----------------------------------------------------------------------------------
 
-    for opt, val in options.items():
-        lines.append(f"set_option -{opt} {val}")
-
-    lines.append("run all")
-
-    tcl = "\n".join(lines)
-    with open("run.tcl", "w") as f:
-        f.write(tcl)
-
-class GowinToolchain():
-
-    attr_translate = {
-        "keep":             None,
-        "no_retiming":      None,
-        "async_reg":        None,
-        "mr_ff":            None,
-        "mr_false_path":    None,
-        "ars_ff1":          None,
-        "ars_ff2":          None,
-        "ars_false_path":   None,
-        "no_shreg_extract": None
-    }
+class GowinToolchain(GenericToolchain):
+    attr_translate = {}
 
     def __init__(self):
+        super().__init__()
         self.options = {}
+        self.additional_cst_commands = []
+        self.additional_tcl_commands = []
+        self.generated_clocks = []
 
-    def build(self, platform, fragment,
-        build_dir      = "build",
-        build_name     = "top",
-        run            = True,
-        **kwargs):
+    def finalize(self):
+        if self.platform.verilog_include_paths:
+            use_windows_paths = _gowin_uses_windows_paths()
+            include_paths = [
+                _gowin_tcl_path(p, use_windows_paths=use_windows_paths)
+                for p in self.platform.verilog_include_paths
+            ]
+            self.options["include_path"] = "{" + ";".join(include_paths) + "}"
 
-        # Create build directory
-        cwd = os.getcwd()
-        os.makedirs(build_dir, exist_ok=True)
-        os.chdir(build_dir)
+        self.apply_gw_jtag_integration(self._build_name + ".v")
+        self.apply_hyperram_integration_hack(self._build_name + ".v")
+        self.apply_async_read_memories(self._build_name + ".v")
 
-        # Finalize design
-        if not isinstance(fragment, _Fragment):
-            fragment = fragment.get_fragment()
-        platform.finalize(fragment)
+    def apply_gw_jtag_integration(self, v_file):
+        with open(v_file, "r") as f:
+            verilog = f.read()
 
-        # Generate verilog
-        v_output = platform.get_verilog(fragment, name=build_name, **kwargs)
-        named_sc, named_pc = platform.resolve_signals(v_output.ns)
-        v_file = build_name + ".v"
-        v_output.write(v_file)
-        platform.add_source(v_file)
+        # No JTAG? skip
+        if "GW_JTAG" not in verilog:
+            return
 
-        if platform.verilog_include_paths:
-            self.options['include_path'] = '{' + ';'.join(platform.verilog_include_paths) + '}'
+        # Integrates gw_jtag.v file from Gowin toolchain.
+        gw_ide_path = _gowin_ide_path()
+        if gw_ide_path is not None:
+            gw_ipcores_path = os.path.join(gw_ide_path, "data", "ipcores")
+            self.platform.add_source(os.path.join(gw_ipcores_path, "gw_jtag.v"))
 
-        # Generate constraints file (.cst)
-        _build_cst(
-            named_sc                = named_sc,
-            named_pc                = named_pc)
+    def apply_async_read_memories(self, v_file):
+        # Memories with an asynchronous read port on distributed RAMs (Gowin maps them to Block RAMs
+        # with a different behavior, see _gowin_async_read_memories).
+        with open(v_file, "r") as f:
+            verilog = f.read()
+        verilog, names = _gowin_async_read_memories(verilog)
+        if names:
+            with open(v_file, "w") as f:
+                f.write(verilog)
 
-        # Generate TCL build script
-        script = _build_script(
-            name                    = platform.devicename,
-            partnumber              = platform.device,
-            files                   = platform.sources,
-            options                 = self.options)
+    def apply_hyperram_integration_hack(self, v_file):
+        # FIXME: Gowin EDA expects a very specific HypeRAM integration pattern, modify generated verilog to match it.
 
-        # Run
-        if run:
-            if which("gw_sh") is None:
-                msg = "Unable to find Gowin toolchain, please:\n"
-                msg += "- Add Gowin toolchain to your $PATH."
-                raise OSError(msg)
+        # Convert to vectors.
+        tools.replace_in_file(v_file, "O_hpram_reset_n", "O_hpram_reset_n[0]")
+        tools.replace_in_file(v_file, "O_hpram_cs_n",    "O_hpram_cs_n[0]")
+        tools.replace_in_file(v_file, "O_hpram_rwds",    "O_hpram_rwds[0]")
+        tools.replace_in_file(v_file, "O_hpram_ck ",     "O_hpram_ck[0] ")
+        tools.replace_in_file(v_file, "O_hpram_ck_n ",   "O_hpram_ck_n[0] ")
+        tools.replace_in_file(v_file, "O_hpram_ck,",     "O_hpram_ck[0],")
+        tools.replace_in_file(v_file, "O_hpram_ck_n,",   "O_hpram_ck_n[0],")
+        tools.replace_in_file(v_file, "wire O_hpram_reset_n[0]", "wire [0:0] O_hpram_reset_n")
+        tools.replace_in_file(v_file, "wire O_hpram_cs_n[0]",    "wire [0:0] O_hpram_cs_n")
+        tools.replace_in_file(v_file, "wire IO_hpram_rwds[0]",   "wire [0:0] IO_hpram_rwds")
+        tools.replace_in_file(v_file, "wire O_hpram_ck[0]",      "wire [0:0] O_hpram_ck")
+        tools.replace_in_file(v_file, "wire O_hpram_ck_n[0]",    "wire [0:0] O_hpram_ck_n")
 
-            if subprocess.call(["gw_sh", "run.tcl"]) != 0:
-                raise OSError("Error occured during Gowin's script execution.")
+        # Apply Synthesis directives.
+        tools.replace_in_file(v_file, "wire [0:0] IO_hpram_rwds,", "wire [0:0] IO_hpram_rwds, /* synthesis syn_tristate = 1 */")
+        tools.replace_in_file(v_file, "wire [7:0] IO_hpram_dq,",    "wire [7:0] IO_hpram_dq,  /* synthesis syn_tristate = 1 */")
+        tools.replace_in_file(v_file, "[1:0] IO_psram_rwds,", "[1:0] IO_psram_rwds, /* synthesis syn_tristate = 1 */")
+        tools.replace_in_file(v_file, "[15:0] IO_psram_dq,",    "[15:0] IO_psram_dq,  /* synthesis syn_tristate = 1 */")
 
-        os.chdir(cwd)
+    # Constraints (.cst ) --------------------------------------------------------------------------
 
-        return v_output.ns
+    def build_io_constraints(self):
+        _build_cst(self.named_sc, self.named_pc, self.additional_cst_commands, self._build_name)
+        return (f"{self._build_name}.cst", "CST")
+
+    # Timing Constraints (.sdc ) -------------------------------------------------------------------
+
+    def build_timing_constraints(self, vns):
+        sdc         = []
+        clock_names = {}
+
+        def clock_object(clk):
+            name = vns.get_name(clk)
+            kind = "ports" if any(sig == name for sig, _, _, _ in self.named_sc) else "nets"
+            return f"[get_{kind} {{{name}}}]"
+
+        for clk, [period, name] in sorted(self.clocks.items(), key=lambda x: x[0].duid):
+            if name is None:
+                name = vns.get_name(clk)
+            clock_names[clk] = name
+            sdc.append(f"create_clock -name {name} -period {period} {clock_object(clk)}")
+        for clk, source, divide_by, multiply_by, name, pin in self.generated_clocks:
+            name   = vns.get_name(clk) if name is None else name
+            target = clock_object(clk) if pin is None else f"[get_pins {{{pin}}}]"
+            clock_names[clk] = name
+            sdc.append(f"create_generated_clock -name {name} -source {clock_object(source)} "
+                f"-divide_by {divide_by} -multiply_by {multiply_by} {target}")
+
+        # False paths refer to clock names, including explicitly named generated clocks.
+        def clock_name(clk):
+            if isinstance(clk, str):
+                return clk
+            return clock_names.get(clk, vns.get_name(clk))
+
+        for from_, to in sorted(self.false_paths, key=lambda p: tuple(clock_name(clk) for clk in p)):
+            sdc.append(f"set_false_path -from [get_clocks {{{clock_name(from_)}}}] "
+                f"-to [get_clocks {{{clock_name(to)}}}]")
+        tools.write_to_file(f"{self._build_name}.sdc", "\n".join(sdc))
+        return (f"{self._build_name}.sdc", "SDC")
+
+    def add_generated_clock_constraint(self, clk, source, divide_by=1, multiply_by=1, name=None, pin=None):
+        # Add parent clocks before their derived clocks. With pin, the clock is created on this
+        # primitive pin (ex: "pll/CLKOUT0": Gowin doesn't accept PLL outputs nets as clock objects)
+        # and named after clk (false paths can then refer to clk).
+        if any(not isinstance(factor, int) or factor < 1 for factor in (divide_by, multiply_by)):
+            raise ValueError("Generated clock factors must be positive integers.")
+        clk.attr.add("keep")
+        source.attr.add("keep")
+        self.generated_clocks.append((clk, source, divide_by, multiply_by, name, pin))
+
+    # Project (tcl) --------------------------------------------------------------------------------
+
+    def build_project(self):
+        tcl = []
+
+        # Set Device.
+        tcl.append(f"set_device -name {self.platform.devicename} {self.platform.device}")
+
+        # Add IOs Constraints.
+        tcl.append(f"add_file {self._build_name}.cst")
+
+        # Add Timings Constraints.
+        tcl.append(f"add_file {self._build_name}.sdc")
+
+        use_windows_paths = _gowin_uses_windows_paths()
+
+        # Add Sources.
+        for f, typ, lib, *_ in self.platform.sources:
+            f = _gowin_tcl_path(f, use_windows_paths=use_windows_paths)
+            tcl.append(f"add_file {f}")
+
+        # Set Options.
+        for opt, val in self.options.items():
+            tcl.append(f"set_option -{opt} {val}")
+
+        # Additionals Commands.
+        for additional_tcl_command in self.additional_tcl_commands:
+            tcl.append(additional_tcl_command)
+
+        # Run.
+        tcl.append("run all")
+
+        # Generate .tcl.
+        tools.write_to_file("run.tcl", "\n".join(tcl))
+
+    # Script ---------------------------------------------------------------------------------------
+
+    def build_script(self):
+        return "" # gw_sh use
+
+    def run_script(self, script):
+        gw_sh, gw_sh_path = _find_gowin_shell()
+
+        if gw_sh_path is None:
+            msg = "Unable to find Gowin toolchain, please:\n"
+            msg += "- Add Gowin toolchain to your $PATH."
+            raise OSError(msg)
+
+        # Resolve the path in case it is a symlink.
+        gw_sh_path = os.path.realpath(gw_sh_path)
+
+        # Prefer Gowin's bundled libs (avoids Qt/libstdc++ version mismatches).
+        env           = os.environ.copy()
+        export_values = {
+            True:  ["DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH"],
+            False: ["LD_LIBRARY_PATH"]
+        }[platform.system() == "Darwin"]
+
+        # Based on gw_sh path gowin_lib is 1 directory before
+        # So split path, removes binary name and bin directory
+        # Before rebuilding the path
+        gowin_lib = os.path.join(os.path.dirname(os.path.dirname(gw_sh_path)), "lib")
+
+        if os.path.isdir(gowin_lib):
+            for value in export_values:
+                env[value] = gowin_lib + ((":" + env[value]) if env.get(value) else "")
+        if subprocess.call([gw_sh, "run.tcl"], env=env) != 0:
+            raise OSError("Error occured during Gowin's script execution.")
+
+        # Copy Bitstream to from impl to gateware directory.
+        copyfile(
+            os.path.join("impl", "pnr", "project.fs"),
+            os.path.join(self._build_name + ".fs")
+        )
